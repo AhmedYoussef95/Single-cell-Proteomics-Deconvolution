@@ -567,6 +567,10 @@ errors <- lapply(clusters, function(clust){
     as.matrix() %>% 
     t()
   
+  #make X and X' follow the same order
+  X <- X[,order(colnames(X))]
+  X_hat <- X_hat[,order(colnames(X_hat))]
+  
   #find RMSE between X and X'
   rmse <- norm(X - X_hat, type = "f") / norm(X, type = "f")
   
@@ -608,6 +612,10 @@ errors2 <- lapply(clusters, function(clust){
   
   #predict single-cell matrix X'
   X_hat <- computeSCprofiles(bulk = Y_hat, timeProportions = A)
+  
+  #make X and X' follow the same order
+  X <- X[,order(colnames(X))]
+  X_hat <- X_hat[,order(colnames(X_hat))]
   
   #find RMSE between X and X'
   rmse <- norm(X - X_hat, type = "f") / norm(X, type = "f")
