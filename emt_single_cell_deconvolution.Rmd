@@ -27,6 +27,8 @@ library(Seurat) #scRNA clustering
 library(VennDiagram) #venn diagram
 library(umap) #UMAP
 library(pracma) #distance between matrices
+library(Matrix) #matrix operations
+library(quadprog) #solving constrained OLS problem
 ```
 
 # Introduction
@@ -533,7 +535,7 @@ computeSCprofiles <- function(bulk, timeProportions){
 }
 ```
 
-```{r predictSingleCellProfilesFromBulkAndTimeProportions, message=FALSE, results='hide', out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
+```{r predictSingleCellProfilesFromPseudoBulk, message=FALSE, results='hide', out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
 #list of resolutions for different numbers of seurat clusters
 clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
 
@@ -610,7 +612,7 @@ errors2 <- lapply(clusters, function(clust){
   #reconstruct bulk matrix
   Y_hat <- A %*% X
   
-  #predict single-cell matrix X'
+                  #predict single-cell matrix X'
   X_hat <- computeSCprofiles(bulk = Y_hat, timeProportions = A)
   
   #make X and X' follow the same order
@@ -677,6 +679,156 @@ The above plots are now shown on the same plot below.
 ```{r comparingSCpredictionErrorsDifferentBulkData}
 allErrors <- do.call("rbind", list(unlist(errors), unlist(errors2), unlist(errors3) ))
 rownames(allErrors) <- c("Pseudo-bulk Y", "Pseudo-bulk Y'", "Actual bulk")
-matplot(t(allErrors), type = c("b"), pch = 1, col = 1:3, xlab = "Number of clusters", ylab = "RMSE", x = 5:15)
+matplot(t(allErrors), type = c("b"), pch = 1, col = 1:3,
+        main = "Predicting single-cell profiles from bulk using OLS", xlab = "Number of clusters", ylab = "Relative RMSE", x = 5:15)
 legend("topleft", legend = rownames(allErrors), col=1:3, pch=1) # optional legend
 ```
+
+## Constraining the solution to be positive
+
+The (Tsoucas et al)[https://www.nature.com/articles/s41467-019-10802-z] publication proposed a strategy for RNA deconvolution based on the OLS formulation we used in this report, with the addition of constraining the solution to be positive since there are no possible negative gene counts, and increasing the weight of cell types with low average expression levels. Since we typically have more cell types than time points, our problem is underdetermined and as such there are multiple possible solutions. In this section, we follow their strategy for constraining the solution to be non-negative.
+
+We solve $\hat{X} = min_{x >= 0}||AX-Y||^2$ which algebraically is the same as solving $\hat{X} = min_{x >= 0}(-2Y^T A X + X^T A^T A X)$. The R function (solve.QP)[https://www.rdocumentation.org/packages/quadprog/versions/1.5-8/topics/solve.QP] from the *quadprog* package is used to solve this equation one gene at a time to estimate the expression profile at the cell-type level. This algorithm, however, expects a positive definite matrix. The matrix $A^TA$ is positive definite when $A$ has more rows than columns – i.e., when the problem is a least-squares problem. When we have more clusters than timepoints then $A$ has more columns than rows, and so the matrix is not invertible, and so it is not positive definite. As a temporary workaround, the ($nearPD$)[https://www.rdocumentation.org/packages/Matrix/versions/1.3-4/topics/nearPD] function is used to compute the nearest positive-definite matrix in order to solve the OLS this way.
+
+```{r solveQP, results='hide', out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
+#function to solve QP problem given A and Y
+computeSCprofiles <- function(bulk, timeProportions){
+  
+  #iterate over genes
+  sc <- apply(bulk, 2, function(gene){
+    #define required matrices/vectors for the quadratic solver
+    Dmat <- t(timeProportions) %*% timeProportions
+    dvec <- t(timeProportions) %*% gene
+    Amat <- diag(ncol(timeProportions))
+    
+    #find nearest positive-definite matrix for D to be able to solve OLS problem
+    Dmat <- as.matrix(Matrix::nearPD(Dmat)$mat)
+    
+    #solve quadratic equation
+    qp <- quadprog::solve.QP(Dmat, dvec, Amat)
+    return(qp$solution)
+  })
+  
+  return(sc)
+}
+
+#compute distance between real matrix and predicted matrix for different number of Seurat clusters
+errors <- lapply(clusters, function(clust){
+  #create pseudo-bulk matrix
+  Y <- t(createPseudoBulk(scrna))
+  
+  #cluster seurat object
+  seurat <- FindClusters(seurat, resolution = clust, random.seed = 123)
+  
+  #create matrix A with proportions of cell clusters in each timepoint
+  A <- computeCellProportions(seurat)
+  
+  #predict single-cell matrix X'
+  X_hat <- computeSCprofiles(bulk = Y, timeProportions = A)
+  
+  #construct matrix with cell-type expression of each gene
+  X <- scrna %>% 
+    mutate(gene = rownames(.)) %>% 
+    melt() %>% 
+    mutate(cell = Idents(seurat)[variable]) %>% 
+    group_by(gene, cell) %>% 
+    summarise(value = mean(value)) %>% 
+    dcast(gene ~ cell) %>% 
+    magrittr::set_rownames(.$gene) %>% 
+    select(-1) %>% 
+    as.matrix() %>% 
+    t()
+  
+  #make X and X' follow the same order
+  X <- X[,order(colnames(X))]
+  X_hat <- X_hat[,order(colnames(X_hat))]
+  
+  #find RMSE between X and X'
+  rmse <- norm(X - X_hat, type = "f") / norm(X, type = "f")
+  
+  return(rmse)
+})
+
+#compute distance between real matrix and predicted matrix for different number of Seurat clusters
+errors2 <- lapply(clusters, function(clust){
+  #cluster seurat object
+  seurat <- FindClusters(seurat, resolution = clust, random.seed = 123)
+  
+  #create matrix A with proportions of cell clusters in each timepoint
+  A <- computeCellProportions(seurat)
+  
+  #construct matrix with cell-type expression of each gene
+  X <- scrna %>% 
+    mutate(gene = rownames(.)) %>% 
+    melt() %>% 
+    mutate(cell = Idents(seurat)[variable]) %>% 
+    group_by(gene, cell) %>% 
+    summarise(value = mean(value)) %>% 
+    dcast(gene ~ cell) %>% 
+    magrittr::set_rownames(.$gene) %>% 
+    select(-1) %>% 
+    as.matrix() %>% 
+    t()
+  
+  #reconstruct bulk matrix
+  Y_hat <- A %*% X
+  
+  #predict single-cell matrix X'
+  X_hat <- computeSCprofiles(bulk = Y_hat, timeProportions = A)
+  
+  #make X and X' follow the same order
+  X <- X[,order(colnames(X))]
+  X_hat <- X_hat[,order(colnames(X_hat))]
+  
+  #find RMSE between X and X'
+  rmse <- norm(X - X_hat, type = "f") / norm(X, type = "f")
+  
+  return(rmse)
+})
+
+errors3 <- lapply(clusters, function(clust){
+  #create bulk matrix
+  Y <- t(mrna)
+  
+  #cluster seurat object
+  seurat <- FindClusters(seurat, resolution = clust, random.seed = 123)
+  
+  #create matrix A with proportions of cell clusters in each timepoint
+  A <- computeCellProportions(seurat)
+  
+  #predict single-cell matrix X'
+  X_hat <- computeSCprofiles(bulk = Y, timeProportions = A)
+  
+  #construct matrix with cell-type expression of each gene
+  X <- scrna %>% 
+    mutate(gene = rownames(.)) %>% 
+    melt() %>% 
+    mutate(cell = Idents(seurat)[variable]) %>% 
+    group_by(gene, cell) %>% 
+    summarise(value = mean(value)) %>% 
+    dcast(gene ~ cell) %>% 
+    magrittr::set_rownames(.$gene) %>% 
+    select(-1) %>% 
+    as.matrix() %>% 
+    t()
+  
+  #keep only the genes present in both datasets
+  overlapGenes <- intersect(colnames(X), colnames(X_hat))
+  X_hat <- X_hat[,overlapGenes]
+  X <- X[,overlapGenes]
+  
+  #find RMSE between X and X'
+  rmse <- norm(X - X_hat, type = "f") / norm(X, type = "f")
+  
+  return(rmse)
+})
+
+allErrors <- do.call("rbind", list(unlist(errors), unlist(errors2), unlist(errors3) ))
+rownames(allErrors) <- c("Pseudo-bulk Y", "Pseudo-bulk Y'", "Actual bulk")
+matplot(t(allErrors), type = c("b"), pch = 1, col = 1:3, xlab = "Number of clusters", ylab = "Relative RMSE",
+        main = "Solving constrained OLS using nearest positive-definite matrix", x = 5:15)
+legend("topleft", legend = rownames(allErrors), col=1:3, pch=1)
+```
+
+
+
