@@ -451,7 +451,9 @@ hist(cors, breaks = 100, main = "Correlation of reconstructed bulk RNA and pseud
 
 In this section, we attempt to re-create the single-cell data from the pseudo-bulk data and the timepoint-specific cell cluster counts. Based on the formula $Y = AX$ outlined in previous sections, given the pseudobulk matrix Y and the timepoint-specific cell counts 'mixing' matrix A, we aim to compute X using the formula $X' = (A^TA)^{-1}(A^TY)$, which is essentially the pseudo-inverse of A multiplied by the pseudo-bulk Y. Recall that the pseudo-bulk is computed by summing up the counts of individual cells in each timepoint.
 
-We vary the number of cell clusters by varying the *resolution* parameter in Seurat's clustering algorithm. We try this method for a number of clusters ranging between 5-15. For each given number of clusters, we solve the formula above to predict $X'$. We then compare this to the actual observed $X$ from the scRNA-Seq data, which is the per-cluster average of gene counts. The errors are reported as relative RMSE using the formula $||X - X'|| / ||X||$ where $||X||$ is the Frobenius norm of the matrix (the square root of the sum of squares of the matrix elements). The resultant cluster-RMSE relationship is shown in the below plot.
+We vary the number of cell clusters by varying the *resolution* parameter in Seurat's clustering algorithm. We try this method for a number of clusters ranging between 5-15. For each given number of clusters, we solve the formula above to predict $X'$. We then compare this to the actual observed $X$ from the scRNA-Seq data, which is the per-cluster average of gene counts. The errors are reported as relative RMSE using the formula $||X - X'|| / ||X||$, where $||X||$ is the Frobenius norm of the matrix (the square root of the sum of squares of the matrix elements). 
+
+This process above is repeated once using $Y'$ as the bulk data, where $Y' = AX$ is computed first prior to computing $X'$ as above, and once using the actual bulk data in this dataset. The resultant cluster-RMSE relationships are shown in the below plot.
 
 ```{r keyFunctions}
 #function to create pseudobulk from scRNA-Seq data
@@ -535,7 +537,7 @@ computeSCprofiles <- function(bulk, timeProportions){
 }
 ```
 
-```{r predictSingleCellProfilesFromPseudoBulk, message=FALSE, results='hide', out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
+```{r predictSingleCellProfilesFromPseudoBulk, message=FALSE, results='hide', eval =F}
 #list of resolutions for different numbers of seurat clusters
 clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
 
@@ -579,15 +581,6 @@ errors <- lapply(clusters, function(clust){
   return(rmse)
 })
 
-#plot no. of clusters to error
-plot(5:15, unlist(errors), main = "Re-creating single-cell data from pseudo-bulk", xlab = "Number of clusters", ylab = "RMSE", 'b')
-```
-
-\newpage
-
-The process above is repeated but this time using $Y'$ as the bulk data, where $Y' = AX$ is computed first prior to computing $X'$ as above.
-
-```{r predictSingleCellFromYhat, results='hide', out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
 #compute distance between real matrix and predicted matrix for different number of Seurat clusters
 errors2 <- lapply(clusters, function(clust){
   #cluster seurat object
@@ -625,13 +618,6 @@ errors2 <- lapply(clusters, function(clust){
   return(rmse)
 })
 
-#plot no. of clusters to error
-plot(5:15, unlist(errors2), main = "Re-creating single-cell data from pseudo-bulk (Y' = AX)", xlab = "Number of clusters", ylab = "RMSE", 'b')
-```
-
-Finally, we repeat the above process using the actual bulk data in this dataset.
-
-```{r predictSingleCellFromActualBulk, results='hide', out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
 #compute distance between real matrix and predicted matrix for different number of Seurat clusters
 errors3 <- lapply(clusters, function(clust){
   #create bulk matrix
@@ -670,15 +656,14 @@ errors3 <- lapply(clusters, function(clust){
   return(rmse)
 })
 
-#plot no. of clusters to error
-plot(5:15, unlist(errors3), main = "Re-creating single-cell data from actual bulk", xlab = "Number of clusters", ylab = "RMSE", type = 'b')
-```
-
-The above plots are now shown on the same plot below.
-
-```{r comparingSCpredictionErrorsDifferentBulkData}
+#show all RMSEs on one plot
 allErrors <- do.call("rbind", list(unlist(errors), unlist(errors2), unlist(errors3) ))
 rownames(allErrors) <- c("Pseudo-bulk Y", "Pseudo-bulk Y'", "Actual bulk")
+saveRDS(allErrors, "/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/relative_RMSE_OLS.rds")
+```
+
+```{r}
+allErrors <- readRDS("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/relative_RMSE_OLS.rds")
 matplot(t(allErrors), type = c("b"), pch = 1, col = 1:3,
         main = "Predicting single-cell profiles from bulk using OLS", xlab = "Number of clusters", ylab = "Relative RMSE", x = 5:15)
 legend("topleft", legend = rownames(allErrors), col=1:3, pch=1) # optional legend
@@ -690,7 +675,7 @@ The (Tsoucas et al)[https://www.nature.com/articles/s41467-019-10802-z] publicat
 
 We solve $\hat{X} = min_{x >= 0}||AX-Y||^2$ which algebraically is the same as solving $\hat{X} = min_{x >= 0}(-2Y^T A X + X^T A^T A X)$. The R function (solve.QP)[https://www.rdocumentation.org/packages/quadprog/versions/1.5-8/topics/solve.QP] from the *quadprog* package is used to solve this equation one gene at a time to estimate the expression profile at the cell-type level. This algorithm, however, expects a positive definite matrix. The matrix $A^TA$ is positive definite when $A$ has more rows than columns – i.e., when the problem is a least-squares problem. When we have more clusters than timepoints then $A$ has more columns than rows, and so the matrix is not invertible, and so it is not positive definite. As a temporary workaround, the ($nearPD$)[https://www.rdocumentation.org/packages/Matrix/versions/1.3-4/topics/nearPD] function is used to compute the nearest positive-definite matrix in order to solve the OLS this way.
 
-```{r solveQP, results='hide', out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold', eval=F}
+```{r solveQP, results='hide', eval=F}
 #function to solve QP problem given A and Y
 computeSCprofiles <- function(bulk, timeProportions){
   
@@ -836,7 +821,7 @@ legend("topleft", legend = rownames(allErrors), col=1:3, pch=1)
 
 Whereas the previous sections examined deconvoluting bulk RNA data, the goal of this project is to deconvolute bulk proteomics data. This section applies the OLS method of deconvolution from the previous sections to predict cell type profiles from bulk proteomics data. Since it is not possible to estimate an RMSE due to a lack of the true single-cell proteomics profiles, the approach is applied once assuming 10 cell clusters in the dataset. The input to the algorithm is the mass spectrometry (MS) profiles of 6,426 proteins across the 8 timepoints along with the counts of each cell type in each timepoint. The output is the proteomics profile of each protein in each of the 10 cell types. The proteomics data had been previously quantile normalized and log-transformed.
 
-```{r scProteomics}
+```{r scProteomics, results='hide'}
 #create bulk proteomics matrix
 Y <- t(proteome)
 
