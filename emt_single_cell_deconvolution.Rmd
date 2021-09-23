@@ -1203,7 +1203,7 @@ Ridge regression is similar to linear regression but with the addition of a regu
 
 4.  Select lambda with minimum accumulated error
 
-```{r ridgeRegression}
+```{r ridgeRegression, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
 #list of resolutions for different numbers of seurat clusters
 clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
 
@@ -1278,13 +1278,16 @@ errors$Number_of_clusters <- as.factor(errors$Number_of_clusters)
 #plot
 ggplot(errors, aes(x = log(Lambda), y = Sum_squared_error, col = Number_of_clusters)) +
   geom_line() + geom_point() +
-  labs(title = "Error of estimating single-cell profiles using ridge regression for different values of lambda",
+  labs(title = "Error of estimating single-cell profiles using ridge regression across values of lambda",
        subtitle = "Each color represents a pre-determined number of cell clusters")
 ```
 
 For each number of clusters, we select the lambda which led to the minimal sum squared error when comparing the predicted single-cell profiles to the actual ones. Those selected lambdas are shown below.
 
 ```{r ridgeRegressionBestLambdas}
+#set of lambdas to test for ridge regression
+lambdaSet <- 10^(4:-4)
+
 #for each number of clusters, find optimal lambda
 bestLambdas <- errors %>% 
   group_by(Number_of_clusters) %>%
@@ -1400,7 +1403,7 @@ colnames(errors) <- c("Number_of_clusters", "Method", "Relative RMSE")
 ggplot(errors, aes(x = Number_of_clusters, y = `Relative RMSE`, col = Method)) +
   geom_line() + geom_point() +
   scale_x_continuous(breaks = 5:15) +
-  labs(title = "Relative RMSE of estimating single-cell profiles using ridge regression and OLS for different numbers of clusters")
+  labs(title = "Relative RMSE of estimating single-cell profiles for different numbers of clusters")
 ```
 
 
