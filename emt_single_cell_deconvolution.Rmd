@@ -29,6 +29,8 @@ library(umap) #UMAP
 library(pracma) #distance between matrices
 library(Matrix) #matrix operations
 library(quadprog) #solving constrained OLS problem
+library(glmnet) #ridge regression
+library(pbapply) # parallelize operations
 ```
 
 # Introduction
@@ -354,6 +356,88 @@ We now attempt to re-create the pseudo-bulk data ($Y$) from the single-cell data
 
 The below heatmaps show the pseudo-bulk data and the re-constructed data side-by-side, with the 8,528 genes in the same order. The heatmaps are scaled by row for visualization purposes. This reconstructed bulk data is then compared to the pseudo-bulk data in each timepoint. Correlations were also computed across the cross-timepoint measurements for each gene. The distributions of these correlations are shown below.
 
+```{r keyFunctions}
+#function to create pseudobulk from scRNA-Seq data
+createPseudoBulk <- function(scrna){
+  #create list of timepoints
+  timepoints <- unique(gsub(pattern = ".*_", replacement = "", colnames(seurat)))
+  
+  #create single-cell pseudo bulk data
+  pseudoBulk <- list()
+  for(t in timepoints){
+    #get single-cell rna-seq in this timepoint
+    curSC <- scrna[, grep(pattern = t, colnames(scrna))]
+    
+    #create pseudo-bulk by summing values
+    curPseudo <- rowSums(curSC)
+    curPseudo[is.na(curPseudo)] <- 0
+    
+    #log-transform and quantile normalize
+    #curPseudo <- log2(curPseudo+1)
+    #curPseudo <- preprocessCore::normalize.quantiles(as.matrix(curPseudo))
+    
+    #add current timepoint pseudo-bulk to list 
+    pseudoBulk[[t]] <- curPseudo
+    rm(curPseudo, curSC)
+  }
+  pseudoBulk <- data.frame(pseudoBulk)
+  rownames(pseudoBulk) <- rownames(scrna)
+  return(as.matrix(pseudoBulk))
+}
+
+#create seurat object for downstream clustering
+createSeurat <- function(scrna){
+  # Initialize the Seurat object with the raw (non-normalized data).
+  seurat <- CreateSeuratObject(counts = scrna, project = "EMT")
+  
+  #normalize data
+  seurat <- NormalizeData(seurat)
+  
+  #find most variable genes
+  seurat <- FindVariableFeatures(seurat, selection.method = "vst", nfeatures = 2000)
+  
+  #scale data
+  all.genes <- rownames(seurat)
+  seurat <- ScaleData(seurat, features = all.genes)
+  
+  #PCA
+  seurat <- RunPCA(seurat, features = VariableFeatures(object = seurat))
+  
+  #construct KNN using 10 PCs
+  seurat <- FindNeighbors(seurat, dims = 1:10)
+  
+  return(seurat)
+}
+
+#function to compute cell-type proportions 'A' given seurat-clustered data
+computeCellProportions <- function(seurat){
+  #construct matrix with number of cells from each type in each timepoint
+  A <- as.data.frame(seurat@assays$RNA@counts) %>% 
+    mutate(gene = rownames(.)) %>% 
+    melt() %>% 
+    mutate(cluster = Idents(seurat)[variable], timepoint = gsub(".*_","", variable)) %>% 
+    group_by(cluster, timepoint) %>% 
+    summarize(count = length(unique(variable))) %>% 
+    tidyr::spread(key = cluster, value = count, fill = 0) %>% 
+    tibble::column_to_rownames("timepoint")
+  
+  #convert to matrix format
+  A <- as.matrix(A)
+  
+  return(A)
+}
+
+#function to recover X from Y' by using X = pseudo-inverse of A * Y'
+computeSCprofiles <- function(bulk, timeProportions){
+  
+  #predict scRNA matrix based on bulk and time proportions matrix
+  #X_hat <- solve(t(A) %*% A) %*% (t(A) %*% Y_hat)
+  sc <- pracma::pinv(timeProportions) %*% bulk
+  
+  return(sc)
+}
+```
+
 ```{r reconstructBulkRNA, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
 #construct matrix with cell-type proportions in each timepoint
 #A <- t(data.frame(timeProportions))
@@ -447,95 +531,62 @@ cors <- unlist(lapply(overlapGenes, function(g)
 hist(cors, breaks = 100, main = "Correlation of reconstructed bulk RNA and pseudo-bulk RNA across genes", ylab = "Genes", xlab = "Pearson R2")
 ```
 
+```{r bulkSimilarityToPseudo, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
+#list of resolutions for different numbers of seurat clusters
+clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
+
+#create seurat object
+seurat <- createSeurat(scrna)
+
+#compute distance between real matrix and predicted matrix for different number of Seurat clusters
+bulkRMSE <- pblapply(clusters, function(clust){
+  #cluster seurat object
+  seurat <- FindClusters(seurat, resolution = clust, random.seed = 123)
+  
+  #create matrix A with proportions of cell clusters in each timepoint
+  A <- computeCellProportions(seurat)
+  
+  #construct matrix with cell-type expression of each gene
+  X <- scrna %>% 
+    mutate(gene = rownames(.)) %>% 
+    melt() %>% 
+    mutate(cell = Idents(seurat)[variable]) %>% 
+    group_by(gene, cell) %>% 
+    summarise(value = mean(value)) %>% 
+    dcast(gene ~ cell) %>% 
+    magrittr::set_rownames(.$gene) %>% 
+    select(-1) %>% 
+    as.matrix() %>% 
+    t()
+  
+  #reconstruct bulk matrix
+  Y_hat <- A %*% X
+  
+  #create pseudo-bulk matrix
+  Y <- t(createPseudoBulk(scrna))
+  
+  #make Y and Y' follow the same order
+  Y <- Y[,order(colnames(Y))]
+  Y_hat <- Y_hat[,order(colnames(Y_hat))]
+  
+  #find RMSE between Y and Y'
+  rmse <- norm(Y - Y_hat, type = "f") / norm(Y, type = "f")
+  
+  return(rmse)
+}, cl = 6)
+
+plot(x = 5:15, y = unlist(bulkRMSE), type = 'b',
+     main = "Relative RMSE between Y and Y' for different no. of clusters",
+     ylab = "Relative RMSE", xlab = "Number of clusters")
+```
+
 ## Re-construct single-cell data from pseudo-bulk data
 
 In this section, we attempt to re-create the single-cell data from the pseudo-bulk data and the timepoint-specific cell cluster counts. Based on the formula $Y = AX$ outlined in previous sections, given the pseudobulk matrix Y and the timepoint-specific cell counts 'mixing' matrix A, we aim to compute X using the formula $X' = (A^TA)^{-1}(A^TY)$, which is essentially the pseudo-inverse of A multiplied by the pseudo-bulk Y. Recall that the pseudo-bulk is computed by summing up the counts of individual cells in each timepoint.
 
-We vary the number of cell clusters by varying the *resolution* parameter in Seurat's clustering algorithm. We try this method for a number of clusters ranging between 5-15. For each given number of clusters, we solve the formula above to predict $X'$. We then compare this to the actual observed $X$ from the scRNA-Seq data, which is the per-cluster average of gene counts. The errors are reported as relative RMSE using the formula $||X - X'|| / ||X||$, where $||X||$ is the Frobenius norm of the matrix (the square root of the sum of squares of the matrix elements). 
+We vary the number of cell clusters by varying the *resolution* parameter in Seurat's clustering algorithm. We try this method for a number of clusters ranging between 5-15. For each given number of clusters, we solve the formula above to predict $X'$. We then compare this to the actual observed $X$ from the scRNA-Seq data, which is the per-cluster average of gene counts. The errors are reported as relative RMSE using the formula $||X - X'|| / ||X||$, where $||X||$ is the Frobenius norm of the matrix (the square root of the sum of squares of the matrix elements).
 
 This process above is repeated once using $Y'$ as the bulk data, where $Y' = AX$ is computed first prior to computing $X'$ as above, and once using the actual bulk data in this dataset. The resultant cluster-RMSE relationships are shown in the below plot.
-
-```{r keyFunctions}
-#function to create pseudobulk from scRNA-Seq data
-createPseudoBulk <- function(scrna){
-  #create list of timepoints
-  timepoints <- unique(gsub(pattern = ".*_", replacement = "", colnames(seurat)))
-  
-  #create single-cell pseudo bulk data
-  pseudoBulk <- list()
-  for(t in timepoints){
-    #get single-cell rna-seq in this timepoint
-    curSC <- scrna[, grep(pattern = t, colnames(scrna))]
-    
-    #create pseudo-bulk by summing values
-    curPseudo <- rowSums(curSC)
-    curPseudo[is.na(curPseudo)] <- 0
-    
-    #log-transform and quantile normalize
-    #curPseudo <- log2(curPseudo+1)
-    #curPseudo <- preprocessCore::normalize.quantiles(as.matrix(curPseudo))
-    
-    #add current timepoint pseudo-bulk to list 
-    pseudoBulk[[t]] <- curPseudo
-    rm(curPseudo, curSC)
-  }
-  pseudoBulk <- data.frame(pseudoBulk)
-  rownames(pseudoBulk) <- rownames(scrna)
-  return(as.matrix(pseudoBulk))
-}
-
-#create seurat object for downstream clustering
-createSeurat <- function(scrna){
-  # Initialize the Seurat object with the raw (non-normalized data).
-  seurat <- CreateSeuratObject(counts = scrna, project = "EMT")
-  
-  #normalize data
-  seurat <- NormalizeData(seurat)
-  
-  #find most variable genes
-  seurat <- FindVariableFeatures(seurat, selection.method = "vst", nfeatures = 2000)
-  
-  #scale data
-  all.genes <- rownames(seurat)
-  seurat <- ScaleData(seurat, features = all.genes)
-  
-  #PCA
-  seurat <- RunPCA(seurat, features = VariableFeatures(object = seurat))
-  
-  #construct KNN using 10 PCs
-  seurat <- FindNeighbors(seurat, dims = 1:10)
-  
-  return(seurat)
-}
-
-#function to compute cell-type proportions 'A' given seyrat-clustered data
-computeCellProportions <- function(seurat){
-  #construct matrix with number of cells from each type in each timepoint
-  A <- as.data.frame(seurat@assays$RNA@counts) %>% 
-    mutate(gene = rownames(.)) %>% 
-    melt() %>% 
-    mutate(cluster = Idents(seurat)[variable], timepoint = gsub(".*_","", variable)) %>% 
-    group_by(cluster, timepoint) %>% 
-    summarize(count = length(unique(variable))) %>% 
-    tidyr::spread(key = cluster, value = count, fill = 0) %>% 
-    tibble::column_to_rownames("timepoint")
-  
-  #convert to matrix format
-  A <- as.matrix(A)
-  
-  return(A)
-}
-
-#function to recover X from Y' by using X = pseudo-inverse of A * Y'
-computeSCprofiles <- function(bulk, timeProportions){
-  
-  #predict scRNA matrix based on bulk and time proportions matrix
-  #X_hat <- solve(t(A) %*% A) %*% (t(A) %*% Y_hat)
-  sc <- pracma::pinv(timeProportions) %*% bulk
-  
-  return(sc)
-}
-```
 
 ```{r predictSingleCellProfilesFromPseudoBulk, message=FALSE, results='hide', eval=F}
 #list of resolutions for different numbers of seurat clusters
@@ -662,7 +713,7 @@ rownames(allErrors) <- c("Pseudo-bulk Y", "Pseudo-bulk Y'", "Actual bulk")
 saveRDS(allErrors, "/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/relative_RMSE_OLS.rds")
 ```
 
-```{r  plotSCpredictionsRMSE, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold',}
+```{r  plotSCpredictionsRMSE, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
 allErrors <- readRDS("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/relative_RMSE_OLS.rds")
 matplot(t(allErrors), type = c("b"), pch = 1, col = 1:3,
         main = "Predicting single-cell profiles from bulk using OLS", xlab = "Number of clusters", ylab = "Relative RMSE", x = 5:15)
@@ -670,6 +721,7 @@ legend("topleft", legend = rownames(allErrors), col=1:3, pch=1) # optional legen
 ```
 
 \newpage
+
 ```{r visualizeXhatHeatmaps, results = 'hide', fig.width=16}
 #list of resolutions for different numbers of seurat clusters
 clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
@@ -680,70 +732,111 @@ seurat <- createSeurat(scrna)
 #for(clust in clusters){
 
 clust <- clusters["8"]
-  #cluster seurat object
-  seurat <- FindClusters(seurat, resolution = clust, random.seed = 123)
-  
-  #get number of clusters
-  nClust <- length(unique(Idents(seurat)))
-  
-  #create matrix A with proportions of cell clusters in each timepoint
-  A <- computeCellProportions(seurat)
-  
-  #construct matrix with cell-type expression of each gene
-  X <- scrna %>% 
-    mutate(gene = rownames(.)) %>% 
-    melt() %>% 
-    mutate(cell = Idents(seurat)[variable]) %>% 
-    group_by(gene, cell) %>% 
-    summarise(value = mean(value)) %>% 
-    dcast(gene ~ cell) %>% 
-    magrittr::set_rownames(.$gene) %>% 
-    select(-1) %>% 
-    as.matrix() %>% 
-    t()
-  
-  #create pseudo-bulk matrix
-  Y <- t(createPseudoBulk(scrna))
-  
-  #reconstruct bulk matrix
-  Y_hat <- A %*% X
-  
-  #create bulk matrix
-  bulk <- t(mrna)
-  
-  #predict single-cell matrix X'
-  X_hat_Y <- computeSCprofiles(bulk = Y, timeProportions = A)
-  X_hat_Yhat <- computeSCprofiles(bulk = Y_hat, timeProportions = A)
-  X_hat_bulk <- computeSCprofiles(bulk = bulk, timeProportions = A)
-  
-  #keep only the genes present in both datasets
-  overlapGenes <- intersect(colnames(X), colnames(X_hat_bulk))
-  X_hat_Y <- X_hat_Y[,overlapGenes]
-  X_hat_Yhat <- X_hat_Yhat[,overlapGenes]
-  X_hat_bulk <- X_hat_bulk[,overlapGenes]
-  X <- X[,overlapGenes]
-  
-  #put into one table
-  allX <- do.call("rbind", list(X, X_hat_Y, X_hat_Yhat, X_hat_bulk))
-  
-  #names of matrices
-  matrixNames <- c("X (8 clusters)", "X predicted from pseudobulk Y", "X predicted from re-created pseudobulk Y'", "X predicted from actual bulk")
-  
-  #create heatmaps
-  ComplexHeatmap::Heatmap(t(allX),
+#cluster seurat object
+seurat <- FindClusters(seurat, resolution = clust, random.seed = 123)
+
+#get number of clusters
+nClust <- length(unique(Idents(seurat)))
+
+#create matrix A with proportions of cell clusters in each timepoint
+A <- computeCellProportions(seurat)
+
+#construct matrix with cell-type expression of each gene
+X <- scrna %>% 
+  mutate(gene = rownames(.)) %>% 
+  melt() %>% 
+  mutate(cell = Idents(seurat)[variable]) %>% 
+  group_by(gene, cell) %>% 
+  summarise(value = mean(value)) %>% 
+  dcast(gene ~ cell) %>% 
+  magrittr::set_rownames(.$gene) %>% 
+  select(-1) %>% 
+  as.matrix() %>% 
+  t()
+
+#create pseudo-bulk matrix
+Y <- t(createPseudoBulk(scrna))
+
+#reconstruct bulk matrix
+Y_hat <- A %*% X
+
+#create bulk matrix
+bulk <- t(mrna)
+
+#predict single-cell matrix X'
+X_hat_Y <- computeSCprofiles(bulk = Y, timeProportions = A)
+X_hat_Yhat <- computeSCprofiles(bulk = Y_hat, timeProportions = A)
+X_hat_bulk <- computeSCprofiles(bulk = bulk, timeProportions = A)
+
+#keep only the genes present in both datasets
+overlapGenes <- intersect(colnames(X), colnames(X_hat_bulk))
+X_hat_Y <- X_hat_Y[,overlapGenes]
+X_hat_Yhat <- X_hat_Yhat[,overlapGenes]
+X_hat_bulk <- X_hat_bulk[,overlapGenes]
+X <- X[,overlapGenes]
+
+#put into one table
+allX <- do.call("rbind", list(X, X_hat_Y, X_hat_Yhat, X_hat_bulk))
+
+#names of matrices
+matrixNames <- c("X (8 clusters)", "X predicted from pseudobulk Y", "X predicted from re-created pseudobulk Y'", "X predicted from actual bulk")
+
+#create heatmaps
+ComplexHeatmap::Heatmap(t(allX),
                         name = "Counts", cluster_columns = FALSE, cluster_rows = T,
                         column_split = rep(matrixNames, each = nClust), use_raster = T, 
                         show_row_names = F, show_column_names = F, 
                         row_title = "Genes")
-  
+
 ```
 
+## Variation of gene expression within cell type across timepoints
 
+```{r geneVarWithinCluster, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
+#list of resolutions for different numbers of seurat clusters
+clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
+
+#create seurat object
+seurat <- createSeurat(scrna)
+
+#compute distance between real matrix and predicted matrix for different number of Seurat clusters
+geneCV <- pblapply(clusters, function(clust){
+  #cluster seurat object
+  seurat <- FindClusters(seurat, resolution = clust, random.seed = 123)
+  
+  #create matrix A with proportions of cell clusters in each timepoint
+  A <- computeCellProportions(seurat)
+  
+  #find pairings where a cluster is not present in a timepoint
+  pairings <- which(A==0, arr.ind = T) %>% 
+    as.data.frame() %>% 
+    mutate(row = rownames(A)[.$row], col = colnames(A)[.$col], key = paste(row, col, sep = "-")) %>% 
+    .$key
+  
+  #compute coefficient of variation of genes in each cluster
+  geneCV <- scrna %>% 
+    mutate(gene = rownames(.)) %>% 
+    melt() %>% 
+    mutate(cluster = Idents(seurat)[variable], timepoint = gsub(".*_","", variable), key = paste(timepoint, cluster, sep = "-")) %>%
+    filter(! key %in% pairings) %>% 
+    group_by(cluster, gene, timepoint) %>% 
+    summarise(counts = mean(value)) %>% 
+    group_by(cluster, gene) %>% 
+    summarise(cv = sd(counts) / mean(counts))
+  
+  return(mean(geneCV$cv, na.rm=TRUE))
+}, cl = 6)
+
+
+plot(x = 5:15, y = unlist(geneCV), type = 'b',
+     main = "For a given cluster, how does its average expression of a gene change across timepoints?",
+     ylab = "Average CV", xlab = "Number of clusters")
+```
 ## Constraining the solution to be positive
 
-The (Tsoucas et al)[https://www.nature.com/articles/s41467-019-10802-z] publication proposed a strategy for RNA deconvolution based on the OLS formulation we used in this report, with the addition of constraining the solution to be positive since there are no possible negative gene counts, and increasing the weight of cell types with low average expression levels. Since we typically have more cell types than time points, our problem is underdetermined and as such there are multiple possible solutions. In this section, we follow their strategy for constraining the solution to be non-negative.
+The (Tsoucas et al)[<https://www.nature.com/articles/s41467-019-10802-z>] publication proposed a strategy for RNA deconvolution based on the OLS formulation we used in this report, with the addition of constraining the solution to be positive since there are no possible negative gene counts, and increasing the weight of cell types with low average expression levels. Since we typically have more cell types than time points, our problem is underdetermined and as such there are multiple possible solutions. In this section, we follow their strategy for constraining the solution to be non-negative.
 
-We solve $\hat{X} = min_{x >= 0}||AX-Y||^2$ which algebraically is the same as solving $\hat{X} = min_{x >= 0}(-2Y^T A X + X^T A^T A X)$. The R function (solve.QP)[https://www.rdocumentation.org/packages/quadprog/versions/1.5-8/topics/solve.QP] from the *quadprog* package is used to solve this equation one gene at a time to estimate the expression profile at the cell-type level. This algorithm, however, expects a positive definite matrix. The matrix $A^TA$ is positive definite when $A$ has more rows than columns – i.e., when the problem is a least-squares problem. When we have more clusters than timepoints then $A$ has more columns than rows, and so the matrix is not invertible, and so it is not positive definite. As a workaround, we use the function *nearPD()* to find the nearest positive matrix instead.
+We solve $\hat{X} = min_{x >= 0}||AX-Y||^2$ which algebraically is the same as solving $\hat{X} = min_{x >= 0}(-2Y^T A X + X^T A^T A X)$. The R function (solve.QP)[<https://www.rdocumentation.org/packages/quadprog/versions/1.5-8/topics/solve.QP>] from the *quadprog* package is used to solve this equation one gene at a time to estimate the expression profile at the cell-type level. This algorithm, however, expects a positive definite matrix. The matrix $A^TA$ is positive definite when $A$ has more rows than columns -- i.e., when the problem is a least-squares problem. When we have more clusters than timepoints then $A$ has more columns than rows, and so the matrix is not invertible, and so it is not positive definite. As a workaround, we use the function *nearPD()* to find the nearest positive matrix instead.
 
 ```{r solveQP, results='hide', eval=F}
 #function to solve QP problem given A and Y
@@ -760,7 +853,7 @@ computeSCprofiles <- function(bulk, timeProportions){
     #Dmat <- as.matrix(Matrix::nearPD(Dmat)$mat)
     
     #add small scaling of the identitiy matrix to Dmat to make it positive definite
-    diag(Dmat) <- diag(Dmat)+1e-8
+    #diag(Dmat) <- diag(Dmat)+1e-8
     
     #solve quadratic equation
     qp <- quadprog::solve.QP(Dmat, dvec, Amat)
@@ -890,6 +983,30 @@ legend("topleft", legend = rownames(allErrors), col=1:3, pch=1)
 ```
 
 ```{r visualizeXhatHeatmapsQP, results = 'hide', fig.width=16}
+#function to solve QP problem given A and Y
+computeSCprofiles <- function(bulk, timeProportions){
+  
+  #iterate over genes
+  sc <- apply(bulk, 2, function(gene){
+    #define required matrices/vectors for the quadratic solver
+    Dmat <- t(timeProportions) %*% timeProportions
+    dvec <- t(timeProportions) %*% gene
+    Amat <- diag(ncol(timeProportions))
+    
+    #find nearest positive-definite matrix for D to be able to solve OLS problem
+    #Dmat <- as.matrix(Matrix::nearPD(Dmat)$mat)
+    
+    #add small scaling of the identitiy matrix to Dmat to make it positive definite
+    #diag(Dmat) <- diag(Dmat)+1e-8
+    
+    #solve quadratic equation
+    qp <- quadprog::solve.QP(Dmat, dvec, Amat)
+    return(qp$solution)
+  })
+  
+  return(sc)
+}
+
 #list of resolutions for different numbers of seurat clusters
 clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
 
@@ -899,14 +1016,204 @@ seurat <- createSeurat(scrna)
 #for(clust in clusters){
 
 clust <- clusters["9"]
+#cluster seurat object
+seurat <- FindClusters(seurat, resolution = clust, random.seed = 123)
+
+#get number of clusters
+nClust <- length(unique(Idents(seurat)))
+
+#create matrix A with proportions of cell clusters in each timepoint
+A <- computeCellProportions(seurat)
+
+#construct matrix with cell-type expression of each gene
+X <- scrna %>% 
+  mutate(gene = rownames(.)) %>% 
+  melt() %>% 
+  mutate(cell = Idents(seurat)[variable]) %>% 
+  group_by(gene, cell) %>% 
+  summarise(value = mean(value)) %>% 
+  dcast(gene ~ cell) %>% 
+  magrittr::set_rownames(.$gene) %>% 
+  select(-1) %>% 
+  as.matrix() %>% 
+  t()
+
+#create pseudo-bulk matrix
+Y <- t(createPseudoBulk(scrna))
+
+#reconstruct bulk matrix
+Y_hat <- A %*% X
+
+#create bulk matrix
+bulk <- t(mrna)
+
+#predict single-cell matrix X'
+X_hat_Y <- computeSCprofiles(bulk = Y, timeProportions = A)
+X_hat_Yhat <- computeSCprofiles(bulk = Y_hat, timeProportions = A)
+X_hat_bulk <- computeSCprofiles(bulk = bulk, timeProportions = A)
+
+#keep only the genes present in both datasets
+overlapGenes <- intersect(colnames(X), colnames(X_hat_bulk))
+X_hat_Y <- X_hat_Y[,overlapGenes]
+X_hat_Yhat <- X_hat_Yhat[,overlapGenes]
+X_hat_bulk <- X_hat_bulk[,overlapGenes]
+X <- X[,overlapGenes]
+
+#put into one table
+allX <- do.call("rbind", list(X, X_hat_Y, X_hat_Yhat, X_hat_bulk))
+
+#names of matrices
+matrixNames <- c("X (8 clusters)", "X predicted from pseudobulk Y", "X predicted from re-created pseudobulk Y'", "X predicted from actual bulk")
+
+#create heatmaps
+ComplexHeatmap::Heatmap(t(allX),
+                        name = "Counts", cluster_columns = FALSE, cluster_rows = FALSE,
+                        column_split = rep(matrixNames, each = nClust), use_raster = T, 
+                        show_row_names = F, show_column_names = F, 
+                        row_title = "Genes")
+
+```
+
+As an alternative to the *nearPD* function, we add a small scaling of the identity matrix ($10^{-9}$) to $A^T A$, which will make it positive definite and allow *solve.QP* to work. The result is shown below.
+
+```{r visualizeXhatHeatmapsQP2, results = 'hide', fig.width=16}
+computeSCprofiles <- function(bulk, timeProportions){
+  
+  #iterate over genes
+  sc <- apply(bulk, 2, function(gene){
+    #define required matrices/vectors for the quadratic solver
+    Dmat <- t(timeProportions) %*% timeProportions
+    dvec <- t(timeProportions) %*% gene
+    Amat <- diag(ncol(timeProportions))
+    
+    #find nearest positive-definite matrix for D to be able to solve OLS problem
+    #Dmat <- as.matrix(Matrix::nearPD(Dmat)$mat)
+    
+    #add small scaling of the identitiy matrix to Dmat to make it positive definite
+    diag(Dmat) <- diag(Dmat)+1e-8
+    
+    #solve quadratic equation
+    qp <- quadprog::solve.QP(Dmat, dvec, Amat)
+    return(qp$solution)
+  })
+  
+  return(sc)
+}
+
+#list of resolutions for different numbers of seurat clusters
+clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
+
+#create seurat object
+seurat <- createSeurat(scrna)
+
+#for(clust in clusters){
+
+clust <- clusters["8"]
+#cluster seurat object
+seurat <- FindClusters(seurat, resolution = clust, random.seed = 123)
+
+#get number of clusters
+nClust <- length(unique(Idents(seurat)))
+
+#create matrix A with proportions of cell clusters in each timepoint
+A <- computeCellProportions(seurat)
+
+#construct matrix with cell-type expression of each gene
+X <- scrna %>% 
+  mutate(gene = rownames(.)) %>% 
+  melt() %>% 
+  mutate(cell = Idents(seurat)[variable]) %>% 
+  group_by(gene, cell) %>% 
+  summarise(value = mean(value)) %>% 
+  dcast(gene ~ cell) %>% 
+  magrittr::set_rownames(.$gene) %>% 
+  select(-1) %>% 
+  as.matrix() %>% 
+  t()
+
+#create pseudo-bulk matrix
+Y <- t(createPseudoBulk(scrna))
+
+#reconstruct bulk matrix
+Y_hat <- A %*% X
+
+#create bulk matrix
+bulk <- t(mrna)
+
+#predict single-cell matrix X'
+X_hat_Y <- computeSCprofiles(bulk = Y, timeProportions = A)
+X_hat_Yhat <- computeSCprofiles(bulk = Y_hat, timeProportions = A)
+X_hat_bulk <- computeSCprofiles(bulk = bulk, timeProportions = A)
+
+#keep only the genes present in both datasets
+overlapGenes <- intersect(colnames(X), colnames(X_hat_bulk))
+X_hat_Y <- X_hat_Y[,overlapGenes]
+X_hat_Yhat <- X_hat_Yhat[,overlapGenes]
+X_hat_bulk <- X_hat_bulk[,overlapGenes]
+X <- X[,overlapGenes]
+
+#put into one table
+allX <- do.call("rbind", list(X, X_hat_Y, X_hat_Yhat, X_hat_bulk))
+
+#names of matrices
+matrixNames <- c("X (8 clusters)", "X predicted from pseudobulk Y", "X predicted from re-created pseudobulk Y'", "X predicted from actual bulk")
+
+#create heatmaps
+ComplexHeatmap::Heatmap(t(allX),
+                        name = "Counts", cluster_columns = FALSE, cluster_rows = FALSE,
+                        column_split = rep(matrixNames, each = nClust), use_raster = T, 
+                        show_row_names = F, show_column_names = F, 
+                        row_title = "Genes")
+
+```
+
+## Predicting single-cell profiles using ridge regression
+
+The condition number of $A^TA$ for the case where we have 8 single-cell clusters, i.e. as many clusters as there are timepoints, is noticeably high (15,828) compared to a smaller number of clusters which suggests that it is a near-singular matrix. This would explain the relatively high error in estimating the single-cell profiles. In an attemp to address this, we use ridge regression to estimate the single-cell profiles instead.
+
+Ridge regression is similar to linear regression but with the addition of a regularization term $\lambda$. A range of values for $\lambda$ are tested to decide on the optimal one. The R package *glmnet* is used for this task. We solve the problem by fitting a ridge regression model to each gene. The full procedure is outlined below:
+
+[**Input:**]{.ul} Number of clusters *N,* Single-cell expression matrix *SC*
+
+[**Procedure:**]{.ul}
+
+1.  Cluster single-cell matrix *SC into N* clusters using *Seurat*
+
+2.  Construct cluster \* gene matrix ***X*** by computing the average expression of each gene in each cluster
+
+3.  Construct timepoint \* cluster mixing matrix ***A*** by counting the number of cells in each cluster in each timepoint
+
+4.  Construct timepoint \* gene pseudobulk matrix ***Y*** using the formula $Y = AX$
+
+5.  Define $LambdaSet = \{10^0,10^{1}, 10^{2}, 10^{3}, 10^{4}, 10^{-1}, 10^{-2}, 10^{-3}, 10^{-4}\}$
+
+6.  For each column of *Y,* denoted as *y* :
+
+7.  Fit ridge regression model *Beta* using the function `Beta = glmnet(x = A, y = y, lambda = LambdaSet, alpha = 0)`
+
+8.  For each column in *X*, denoted as *x* :
+
+-   For each lambda *L* :
+
+1.  Compute *x'* = column *L* of *Beta*
+
+2.  Compute error in predicting *x* as $||x - x'||^2$
+
+3.  Accumulate error for each lambda as the sum of errors across genes
+
+4.  Select lambda with minimum accumulated error
+
+```{r ridgeRegression}
+#list of resolutions for different numbers of seurat clusters
+clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
+
+#create seurat object
+seurat <- createSeurat(scrna)
+
+#compute distance between real matrix and predicted matrix for different number of Seurat clusters
+errors <- pblapply(clusters, function(clust){
   #cluster seurat object
   seurat <- FindClusters(seurat, resolution = clust, random.seed = 123)
-  
-  #get number of clusters
-  nClust <- length(unique(Idents(seurat)))
-  
-  #create matrix A with proportions of cell clusters in each timepoint
-  A <- computeCellProportions(seurat)
   
   #construct matrix with cell-type expression of each gene
   X <- scrna %>% 
@@ -921,71 +1228,179 @@ clust <- clusters["9"]
     as.matrix() %>% 
     t()
   
+  #create matrix A with proportions of cell clusters in each timepoint
+  A <- computeCellProportions(seurat)
+  
+  #reconstruct bulk matrix
+  Y <- A %*% X
+  
+  #set of lambdas to test for ridge regression
+  lambdaSet <- 10^(4:-4)
+  
+  #iterate over genes (columns of Y) and fit regression model based on counts of clusters in each timepoint
+  ridge <- apply(Y, 2, function(y){
+    #fit ridge regression model
+    Beta <- glmnet(x = A, y = y,  lambda = lambdaSet, alpha = 0)$beta
+    
+    #set column names to indicate lambda values
+    colnames(Beta) <- lambdaSet
+    
+    #return estimated x'
+    return(Beta)
+  })
+  
+  #summarize predictions for each lambda into separate tables
+  X_hat <- lapply(seq_along(lambdaSet), function(lambda){
+    return(do.call("cbind", lapply(ridge, `[`, , lambda)))
+  })
+  names(X_hat) <- lambdaSet
+  
+  #compute squared error between X and X' for each lambda
+  error <- lapply(X_hat, function(cur_X_hat){
+    return(sum(colSums(abs(X - cur_X_hat))^2))
+  })
+  
+  #convert error values to matrix (one column per lambda)
+  error <- do.call("cbind", error)
+  
+  return(error)
+}, cl = 6)
+
+#combine all the errors into one table
+errors <- do.call("rbind", errors)
+rownames(errors) <- names(clusters)
+
+#convert to long format for plotting
+errors <- reshape2::melt(errors)
+colnames(errors) <- c("Number_of_clusters", "Lambda", "Sum_squared_error")
+errors$Number_of_clusters <- as.factor(errors$Number_of_clusters)
+
+#plot
+ggplot(errors, aes(x = log(Lambda), y = Sum_squared_error, col = Number_of_clusters)) +
+  geom_line() + geom_point() +
+  labs(title = "Error of estimating single-cell profiles using ridge regression for different values of lambda",
+       subtitle = "Each color represents a pre-determined number of cell clusters")
+```
+
+For each number of clusters, we select the lambda which led to the minimal sum squared error when comparing the predicted single-cell profiles to the actual ones. Those selected lambdas are shown below.
+
+```{r ridgeRegressionBestLambdas}
+#for each number of clusters, find optimal lambda
+bestLambdas <- errors %>% 
+  group_by(Number_of_clusters) %>%
+  summarise(best_lambda = lambdaSet[which(Sum_squared_error == min(Sum_squared_error))])
+
+#show table with best lambda values
+kable(bestLambdas, caption = "Ridge regression - Lambda values that minimize error") %>%
+  kable_styling(latex_options = c("striped", "hold_position")) %>% 
+  row_spec(row = 0, bold = T, color = "white", background = "gray")
+```
+
+#### Comparing ridge regression to OLS
+
+```{r compareRidgeRegressionToOLS, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
+#predict X' using optimal lambda values for ridge regression
+X_hat_ridge <- pblapply(names(clusters), function(clust){
+  #cluster seurat object
+  seurat <- FindClusters(seurat, resolution = clusters[clust], random.seed = 123)
+  
+  #construct matrix with cell-type expression of each gene
+  X <- scrna %>% 
+    mutate(gene = rownames(.)) %>% 
+    melt() %>% 
+    mutate(cell = Idents(seurat)[variable]) %>% 
+    group_by(gene, cell) %>% 
+    summarise(value = mean(value)) %>% 
+    dcast(gene ~ cell) %>% 
+    magrittr::set_rownames(.$gene) %>% 
+    select(-1) %>% 
+    as.matrix() %>% 
+    t()
+  
+  #create matrix A with proportions of cell clusters in each timepoint
+  A <- computeCellProportions(seurat)
+  
+  #reconstruct bulk matrix
+  Y <- A %*% X
+  
+  #optimal lambda
+  lambda <- unlist(bestLambdas[as.character(bestLambdas$Number_of_clusters) == clust, "best_lambda"])
+  
+  #iterate over genes (columns of Y) and fit regression model based on counts of clusters in each timepoint
+  ridge <- apply(Y, 2, function(y){
+    #fit ridge regression model
+    Beta <- glmnet(x = A, y = y,  lambda = lambda, alpha = 0)$beta
+    
+    #return estimated x'
+    return(Beta)
+  })
+  
+  #combine predictions of all genes into one matrix
+  X_hat <- do.call("cbind", ridge)
+  colnames(X_hat) <- names(ridge)
+  
+  #make X and X' follow the same order
+  X <- X[,order(colnames(X))]
+  X_hat <- X_hat[,order(colnames(X_hat))]
+  
+  #find RMSE between X and X'
+  rmse <- norm(X - X_hat, type = "f") / norm(X, type = "f")
+  
+  return(rmse)
+  
+}, cl = 6)
+
+#compute distance between real matrix and predicted matrix for different number of Seurat clusters
+X_hat_ols <- pblapply(clusters, function(clust){
   #create pseudo-bulk matrix
   Y <- t(createPseudoBulk(scrna))
   
-  #reconstruct bulk matrix
-  Y_hat <- A %*% X
+  #cluster seurat object
+  seurat <- FindClusters(seurat, resolution = clust, random.seed = 123)
   
-  #create bulk matrix
-  bulk <- t(mrna)
+  #create matrix A with proportions of cell clusters in each timepoint
+  A <- computeCellProportions(seurat)
   
   #predict single-cell matrix X'
-  X_hat_Y <- computeSCprofiles(bulk = Y, timeProportions = A)
-  X_hat_Yhat <- computeSCprofiles(bulk = Y_hat, timeProportions = A)
-  X_hat_bulk <- computeSCprofiles(bulk = bulk, timeProportions = A)
+  X_hat <- computeSCprofiles(bulk = Y, timeProportions = A)
   
-  #keep only the genes present in both datasets
-  overlapGenes <- intersect(colnames(X), colnames(X_hat_bulk))
-  X_hat_Y <- X_hat_Y[,overlapGenes]
-  X_hat_Yhat <- X_hat_Yhat[,overlapGenes]
-  X_hat_bulk <- X_hat_bulk[,overlapGenes]
-  X <- X[,overlapGenes]
+  #construct matrix with cell-type expression of each gene
+  X <- scrna %>% 
+    mutate(gene = rownames(.)) %>% 
+    melt() %>% 
+    mutate(cell = Idents(seurat)[variable]) %>% 
+    group_by(gene, cell) %>% 
+    summarise(value = mean(value)) %>% 
+    dcast(gene ~ cell) %>% 
+    magrittr::set_rownames(.$gene) %>% 
+    select(-1) %>% 
+    as.matrix() %>% 
+    t()
   
-  #put into one table
-  allX <- do.call("rbind", list(X, X_hat_Y, X_hat_Yhat, X_hat_bulk))
+  #make X and X' follow the same order
+  X <- X[,order(colnames(X))]
+  X_hat <- X_hat[,order(colnames(X_hat))]
   
-  #names of matrices
-  matrixNames <- c("X (8 clusters)", "X predicted from pseudobulk Y", "X predicted from re-created pseudobulk Y'", "X predicted from actual bulk")
+  #find RMSE between X and X'
+  rmse <- norm(X - X_hat, type = "f") / norm(X, type = "f")
   
-  #create heatmaps
-  ComplexHeatmap::Heatmap(t(allX),
-                        name = "Counts", cluster_columns = FALSE, cluster_rows = FALSE,
-                        column_split = rep(matrixNames, each = nClust), use_raster = T, 
-                        show_row_names = F, show_column_names = F, 
-                        row_title = "Genes")
-  
+  return(rmse)
+}, cl = 6)
+
+#combine all the errors into one table
+errors <- do.call("cbind", list(do.call("rbind", X_hat_ridge), do.call("rbind", X_hat_ols)))
+rownames(errors) <- names(clusters)
+colnames(errors) <- c("Ridge regression", "OLS")
+
+#convert to long format for plotting
+errors <- reshape2::melt(errors)
+colnames(errors) <- c("Number_of_clusters", "Method", "Relative RMSE")
+
+#plot
+ggplot(errors, aes(x = Number_of_clusters, y = `Relative RMSE`, col = Method)) +
+  geom_line() + geom_point() +
+  scale_x_continuous(breaks = 5:15) +
+  labs(title = "Relative RMSE of estimating single-cell profiles using ridge regression and OLS for different numbers of clusters")
 ```
-
-# Predicting single-cell proteomics from bulk proteomics
-
-Whereas the previous sections examined deconvoluting bulk RNA data, the goal of this project is to deconvolute bulk proteomics data. This section applies the OLS method of deconvolution from the previous sections to predict cell type profiles from bulk proteomics data. Since it is not possible to estimate an RMSE due to a lack of the true single-cell proteomics profiles, the approach is applied once assuming 10 cell clusters in the dataset. The input to the algorithm is the mass spectrometry (MS) profiles of 6,426 proteins across the 8 timepoints along with the counts of each cell type in each timepoint. The output is the proteomics profile of each protein in each of the 10 cell types. The proteomics data had been previously quantile normalized and log-transformed.
-
-```{r scProteomics, results='hide', eval = F}
-#create bulk proteomics matrix
-Y <- t(proteome)
-
-#cluster seurat object
-seurat <- FindClusters(seurat, resolution = 0.9, random.seed = 123)
-
-#create matrix A with proportions of cell clusters in each timepoint
-A <- computeCellProportions(seurat)
-
-#predict single-cell matrix X'
-X_hat <- computeSCprofiles(bulk = Y, timeProportions = A)
-
-#heatmap
-#scale original matrix row-wise
-scaledProts <- t(apply(X_hat, 2, scale))
-
-#visualize heatmap
-ComplexHeatmap::Heatmap(scaledProts,
-                        name = "Intensity (scaled row-wise)", cluster_columns = FALSE, 
-                        column_split = 1:10, 
-                        show_row_names = F, show_column_names = F, 
-                        use_raster = T, row_title = "Proteins")
-```
-
-
 
 
