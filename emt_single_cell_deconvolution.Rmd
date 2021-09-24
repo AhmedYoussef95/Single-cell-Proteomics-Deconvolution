@@ -720,7 +720,6 @@ matplot(t(allErrors), type = c("b"), pch = 1, col = 1:3,
 legend("topleft", legend = rownames(allErrors), col=1:3, pch=1) # optional legend
 ```
 
-\newpage
 
 ```{r visualizeXhatHeatmaps, results = 'hide', fig.width=16}
 #list of resolutions for different numbers of seurat clusters
@@ -792,7 +791,7 @@ ComplexHeatmap::Heatmap(t(allX),
 
 ## Variation of gene expression within cell type across timepoints
 
-```{r geneVarWithinCluster, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
+```{r geneVarWithinCluster, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold', fig.width = 10}
 #list of resolutions for different numbers of seurat clusters
 clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
 
@@ -1301,7 +1300,7 @@ kable(bestLambdas, caption = "Ridge regression - Lambda values that minimize err
 
 #### Comparing ridge regression to OLS
 
-```{r compareRidgeRegressionToOLS, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
+```{r compareRidgeRegressionToOLS, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold', fig.width = 12}
 #predict X' using optimal lambda values for ridge regression
 X_hat_ridge <- pblapply(names(clusters), function(clust){
   #cluster seurat object
@@ -1405,5 +1404,78 @@ ggplot(errors, aes(x = Number_of_clusters, y = `Relative RMSE`, col = Method)) +
   scale_x_continuous(breaks = 5:15) +
   labs(title = "Relative RMSE of estimating single-cell profiles for different numbers of clusters")
 ```
+```{r visualizeXhatHeatmapsForRidgeAndOLS, results = 'hide', fig.width=16}
+#list of resolutions for different numbers of seurat clusters
+clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
 
+#create seurat object
+seurat <- createSeurat(scrna)
+
+#scenario with 8 clusters
+clust <- clusters["8"]
+
+#cluster seurat object
+seurat <- FindClusters(seurat, resolution = clust, random.seed = 123)
+
+#get number of clusters
+nClust <- length(unique(Idents(seurat)))
+
+#create matrix A with proportions of cell clusters in each timepoint
+A <- computeCellProportions(seurat)
+
+#construct matrix with cell-type expression of each gene
+X <- scrna %>% 
+  mutate(gene = rownames(.)) %>% 
+  melt() %>% 
+  mutate(cell = Idents(seurat)[variable]) %>% 
+  group_by(gene, cell) %>% 
+  summarise(value = mean(value)) %>% 
+  dcast(gene ~ cell) %>% 
+  magrittr::set_rownames(.$gene) %>% 
+  select(-1) %>% 
+  as.matrix() %>% 
+  t()
+
+#reconstruct bulk matrix
+Y_hat <- A %*% X
+
+#predict single-cell matrix X' using OLS
+X_hat_ols <- computeSCprofiles(bulk = Y_hat, timeProportions = A)
+
+#optimal lambda
+lambda <- unlist(bestLambdas[as.character(bestLambdas$Number_of_clusters) == names(clust), "best_lambda"])
+
+#iterate over genes (columns of Y) and fit regression model based on counts of clusters in each timepoint
+ridge <- pbapply(Y, 2, function(y){
+  #fit ridge regression model
+  Beta <- glmnet(x = A, y = y,  lambda = lambda, alpha = 0)$beta
+  
+  #return estimated x'
+  return(Beta)
+}, cl = 6)
+
+#combine predictions of all genes into one matrix
+X_hat_ridge <- do.call("cbind", ridge)
+colnames(X_hat_ridge) <- names(ridge)
+
+#keep only the genes present in all datasets
+overlapGenes <- intersect(colnames(X), colnames(X_hat_ols))
+X_hat_ols <- X_hat_ols[,overlapGenes]
+X_hat_ridge <- X_hat_ridge[,overlapGenes]
+X <- X[,overlapGenes]
+
+#put into one table
+allX <- as.matrix(do.call("rbind", list(X, X_hat_ols, X_hat_ridge)))
+
+#names of matrices
+matrixNames <- c("X (8 clusters)", "X predicted using OLS", "X predicted using Ridge Regression")
+
+#create heatmaps
+ComplexHeatmap::Heatmap(t(allX),
+                        name = "Counts", cluster_columns = FALSE, cluster_rows = T,
+                        column_split = rep(matrixNames, each = nClust), use_raster = T, 
+                        show_row_names = F, show_column_names = F, 
+                        row_title = "Genes")
+
+```
 
