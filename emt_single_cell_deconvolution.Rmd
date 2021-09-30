@@ -536,7 +536,7 @@ hist(cors, breaks = 100, main = "Correlation of reconstructed bulk RNA and pseud
 clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
 
 #create seurat object
-seurat <- createSeurat(scrna)
+#seurat <- createSeurat(scrna)
 
 #compute distance between real matrix and predicted matrix for different number of Seurat clusters
 bulkRMSE <- pblapply(clusters, function(clust){
@@ -569,24 +569,26 @@ bulkRMSE <- pblapply(clusters, function(clust){
   Y <- Y[,order(colnames(Y))]
   Y_hat <- Y_hat[,order(colnames(Y_hat))]
   
-  #find RMSE between Y and Y'
-  rmse <- norm(Y - Y_hat, type = "f") / norm(Y, type = "f")
+  #find relative error between Y and Y'
+  relativeError <- apply(abs(Y - Y_hat) / Y, 2, mean) %>% 
+    .[!is.infinite(.) & !is.na(.)] %>% 
+    mean(.)
   
-  return(rmse)
+  return(relativeError)
 }, cl = 6)
 
 plot(x = 5:15, y = unlist(bulkRMSE), type = 'b',
-     main = "Relative RMSE between Y and Y' for different no. of clusters",
-     ylab = "Relative RMSE", xlab = "Number of clusters")
+     main = "Relative error between Y and Y' for different no. of clusters",
+     ylab = "Relative error", xlab = "Number of clusters")
 ```
 
 ## Re-construct single-cell data from pseudo-bulk data
 
 In this section, we attempt to re-create the single-cell data from the pseudo-bulk data and the timepoint-specific cell cluster counts. Based on the formula $Y = AX$ outlined in previous sections, given the pseudobulk matrix Y and the timepoint-specific cell counts 'mixing' matrix A, we aim to compute X using the formula $X' = (A^TA)^{-1}(A^TY)$, which is essentially the pseudo-inverse of A multiplied by the pseudo-bulk Y. Recall that the pseudo-bulk is computed by summing up the counts of individual cells in each timepoint.
 
-We vary the number of cell clusters by varying the *resolution* parameter in Seurat's clustering algorithm. We try this method for a number of clusters ranging between 5-15. For each given number of clusters, we solve the formula above to predict $X'$. We then compare this to the actual observed $X$ from the scRNA-Seq data, which is the per-cluster average of gene counts. The errors are reported as relative RMSE using the formula $||X - X'|| / ||X||$, where $||X||$ is the Frobenius norm of the matrix (the square root of the sum of squares of the matrix elements).
+We vary the number of cell clusters by varying the *resolution* parameter in Seurat's clustering algorithm. We try this method for a number of clusters ranging between 5-15. For each given number of clusters, we solve the formula above to predict $X'$. We then compare this to the actual observed $X$ from the scRNA-Seq data, which is the per-cluster average of gene counts. The errors are reported as relative RMAD (relative mean absolute deviation) using the formula $|X - X'| / X$, where $|X|$ is the absolute value of the difference. This error is computed for each gene and the final reported score is the average RMAD value, in other words: *on average, how different is a gene's predicted values compared to the true ones?*
 
-This process above is repeated once using $Y'$ as the bulk data, where $Y' = AX$ is computed first prior to computing $X'$ as above, and once using the actual bulk data in this dataset. The resultant cluster-RMSE relationships are shown in the below plot.
+This process above is repeated once using $Y'$ as the bulk data, where $Y' = AX$ is computed first prior to computing $X'$ as above, and once using the actual bulk data in this dataset. The resultant cluster-RMAD relationships are shown in the below plot.
 
 ```{r predictSingleCellProfilesFromPseudoBulk, message=FALSE, results='hide', eval=F}
 #list of resolutions for different numbers of seurat clusters
@@ -596,7 +598,7 @@ clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
 seurat <- createSeurat(scrna)
 
 #compute distance between real matrix and predicted matrix for different number of Seurat clusters
-errors <- lapply(clusters, function(clust){
+errors <- pblapply(clusters, function(clust){
   #create pseudo-bulk matrix
   Y <- t(createPseudoBulk(scrna))
   
@@ -626,14 +628,16 @@ errors <- lapply(clusters, function(clust){
   X <- X[,order(colnames(X))]
   X_hat <- X_hat[,order(colnames(X_hat))]
   
-  #find RMSE between X and X'
-  rmse <- norm(X - X_hat, type = "f") / norm(X, type = "f")
+  #find relative error between X and X'
+  relativeError <- apply(abs(X - X_hat) / X, 2, mean) %>% 
+    .[!is.infinite(.) & !is.na(.)] %>% 
+    mean(.)
   
-  return(rmse)
-})
+  return(relativeError)
+}, cl = 6)
 
 #compute distance between real matrix and predicted matrix for different number of Seurat clusters
-errors2 <- lapply(clusters, function(clust){
+errors2 <- pblapply(clusters, function(clust){
   #cluster seurat object
   seurat <- FindClusters(seurat, resolution = clust, random.seed = 123)
   
@@ -663,14 +667,16 @@ errors2 <- lapply(clusters, function(clust){
   X <- X[,order(colnames(X))]
   X_hat <- X_hat[,order(colnames(X_hat))]
   
-  #find RMSE between X and X'
-  rmse <- norm(X - X_hat, type = "f") / norm(X, type = "f")
+  #find relative error between X and X'
+  relativeError <- apply(abs(X - X_hat) / X, 2, mean) %>% 
+    .[!is.infinite(.) & !is.na(.)] %>% 
+    mean(.)
   
-  return(rmse)
-})
+  return(relativeError)
+}, cl = 6)
 
 #compute distance between real matrix and predicted matrix for different number of Seurat clusters
-errors3 <- lapply(clusters, function(clust){
+errors3 <- pblapply(clusters, function(clust){
   #create bulk matrix
   Y <- t(mrna)
   
@@ -701,22 +707,24 @@ errors3 <- lapply(clusters, function(clust){
   X_hat <- X_hat[,overlapGenes]
   X <- X[,overlapGenes]
   
-  #find RMSE between X and X'
-  rmse <- norm(X - X_hat, type = "f") / norm(X, type = "f")
+  #find relative error between X and X'
+  relativeError <- apply(abs(X - X_hat) / X, 2, mean) %>% 
+    .[!is.infinite(.) & !is.na(.)] %>% 
+    mean(.)
   
-  return(rmse)
-})
+  return(relativeError)
+}, cl = 6)
 
 #show all RMSEs on one plot
 allErrors <- do.call("rbind", list(unlist(errors), unlist(errors2), unlist(errors3) ))
 rownames(allErrors) <- c("Pseudo-bulk Y", "Pseudo-bulk Y'", "Actual bulk")
-saveRDS(allErrors, "/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/relative_RMSE_OLS.rds")
+saveRDS(allErrors, "/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/relative_RMAD_OLS.rds")
 ```
 
 ```{r  plotSCpredictionsRMSE, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
-allErrors <- readRDS("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/relative_RMSE_OLS.rds")
+allErrors <- readRDS("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/relative_RMAD_OLS.rds")
 matplot(t(allErrors), type = c("b"), pch = 1, col = 1:3,
-        main = "Predicting single-cell profiles from bulk using OLS", xlab = "Number of clusters", ylab = "Relative RMSE", x = 5:15)
+        main = "Predicting single-cell profiles from bulk using OLS", xlab = "Number of clusters", ylab = "Relative error", x = 5:15)
 legend("topleft", legend = rownames(allErrors), col=1:3, pch=1) # optional legend
 ```
 
@@ -726,9 +734,7 @@ legend("topleft", legend = rownames(allErrors), col=1:3, pch=1) # optional legen
 clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
 
 #create seurat object
-seurat <- createSeurat(scrna)
-
-#for(clust in clusters){
+#seurat <- createSeurat(scrna)
 
 clust <- clusters["8"]
 #cluster seurat object
@@ -786,17 +792,16 @@ ComplexHeatmap::Heatmap(t(allX),
                         column_split = rep(matrixNames, each = nClust), use_raster = T, 
                         show_row_names = F, show_column_names = F, 
                         row_title = "Genes")
-
 ```
 
 ## Variation of gene expression within cell type across timepoints
 
-```{r geneVarWithinCluster, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold', fig.width = 10}
+```{r geneVarWithinCluster, fig.width = 12, fig.height = 8, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
 #list of resolutions for different numbers of seurat clusters
 clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
 
 #create seurat object
-seurat <- createSeurat(scrna)
+#seurat <- createSeurat(scrna)
 
 #compute distance between real matrix and predicted matrix for different number of Seurat clusters
 geneCV <- pblapply(clusters, function(clust){
@@ -823,22 +828,23 @@ geneCV <- pblapply(clusters, function(clust){
     group_by(cluster, gene) %>% 
     summarise(cv = sd(counts) / mean(counts))
   
-  return(mean(geneCV$cv, na.rm=TRUE))
+  return(mean(geneCV$cv, na.rm = TRUE))
 }, cl = 6)
 
 
 plot(x = 5:15, y = unlist(geneCV), type = 'b',
      main = "For a given cluster, how does its average expression of a gene change across timepoints?",
-     ylab = "Average CV", xlab = "Number of clusters")
+     ylab = "Average Coef. of Variation", xlab = "Number of clusters")
 ```
-## Constraining the solution to be positive
 
-The (Tsoucas et al)[<https://www.nature.com/articles/s41467-019-10802-z>] publication proposed a strategy for RNA deconvolution based on the OLS formulation we used in this report, with the addition of constraining the solution to be positive since there are no possible negative gene counts, and increasing the weight of cell types with low average expression levels. Since we typically have more cell types than time points, our problem is underdetermined and as such there are multiple possible solutions. In this section, we follow their strategy for constraining the solution to be non-negative.
+## Constraining the solution to be non-negative
 
-We solve $\hat{X} = min_{x >= 0}||AX-Y||^2$ which algebraically is the same as solving $\hat{X} = min_{x >= 0}(-2Y^T A X + X^T A^T A X)$. The R function (solve.QP)[<https://www.rdocumentation.org/packages/quadprog/versions/1.5-8/topics/solve.QP>] from the *quadprog* package is used to solve this equation one gene at a time to estimate the expression profile at the cell-type level. This algorithm, however, expects a positive definite matrix. The matrix $A^TA$ is positive definite when $A$ has more rows than columns -- i.e., when the problem is a least-squares problem. When we have more clusters than timepoints then $A$ has more columns than rows, and so the matrix is not invertible, and so it is not positive definite. As a workaround, we use the function *nearPD()* to find the nearest positive matrix instead.
+The [Tsoucas et al](https://www.nature.com/articles/s41467-019-10802-z) publication proposed a strategy for RNA deconvolution based on the OLS formulation we used in this report, with the addition of constraining the solution to be non-negative since there are no possible negative gene counts, and increasing the weight of cell types with low average expression levels. Since we typically have more cell types than time points, our problem is underdetermined and as such there are multiple possible solutions. In this section, we follow their strategy for constraining the solution to be non-negative.
 
-```{r solveQP, results='hide', eval=F}
-#function to solve QP problem given A and Y
+We solve $\hat{X} = min_{x >= 0}||AX-Y||^2$ which algebraically is the same as solving $\hat{X} = min_{x >= 0}(-2Y^T A X + X^T A^T A X)$. The R function [*solve.QP*](https://www.rdocumentation.org/packages/quadprog/versions/1.5-8/topics/solve.QP) from the [*quadprog*](https://cran.r-project.org/web/packages/quadprog/quadprog.pdf) package is used to solve this equation one gene at a time to estimate the expression profile at the cell-type level. This algorithm, however, expects a positive definite matrix. The matrix $A^TA$ is positive definite when $A$ has more rows than columns, i.e. when the problem is a least-squares problem. When we have more clusters than timepoints then $A$ has more columns than rows, and so the matrix is not invertible, and by extension not positive definite. As a workaround, we use the function [*nearPD*](https://www.rdocumentation.org/packages/Matrix/versions/1.3-4/topics/nearPD) to find the nearest positive matrix instead.
+
+```{r solveQP, results='hide', eval = FALSE}
+#function to solve QP problem given A and Y using nearest positive-definite matrix
 computeSCprofiles <- function(bulk, timeProportions){
   
   #iterate over genes
@@ -849,7 +855,7 @@ computeSCprofiles <- function(bulk, timeProportions){
     Amat <- diag(ncol(timeProportions))
     
     #find nearest positive-definite matrix for D to be able to solve OLS problem
-    #Dmat <- as.matrix(Matrix::nearPD(Dmat)$mat)
+    Dmat <- as.matrix(Matrix::nearPD(Dmat)$mat)
     
     #add small scaling of the identitiy matrix to Dmat to make it positive definite
     #diag(Dmat) <- diag(Dmat)+1e-8
@@ -863,7 +869,7 @@ computeSCprofiles <- function(bulk, timeProportions){
 }
 
 #compute distance between real matrix and predicted matrix for different number of Seurat clusters
-errors <- lapply(clusters, function(clust){
+errors <- pblapply(clusters, function(clust){
   #create pseudo-bulk matrix
   Y <- t(createPseudoBulk(scrna))
   
@@ -893,14 +899,16 @@ errors <- lapply(clusters, function(clust){
   X <- X[,order(colnames(X))]
   X_hat <- X_hat[,order(colnames(X_hat))]
   
-  #find RMSE between X and X'
-  rmse <- norm(X - X_hat, type = "f") / norm(X, type = "f")
+  #find relative error between X and X'
+  relativeError <- apply(abs(X - X_hat) / X, 2, mean) %>% 
+    .[!is.infinite(.) & !is.na(.)] %>% 
+    mean(.)
   
-  return(rmse)
-})
+  return(relativeError)
+}, cl = 6)
 
 #compute distance between real matrix and predicted matrix for different number of Seurat clusters
-errors2 <- lapply(clusters, function(clust){
+errors2 <- pblapply(clusters, function(clust){
   #cluster seurat object
   seurat <- FindClusters(seurat, resolution = clust, random.seed = 123)
   
@@ -930,13 +938,15 @@ errors2 <- lapply(clusters, function(clust){
   X <- X[,order(colnames(X))]
   X_hat <- X_hat[,order(colnames(X_hat))]
   
-  #find RMSE between X and X'
-  rmse <- norm(X - X_hat, type = "f") / norm(X, type = "f")
+  #find relative error between X and X'
+  relativeError <- apply(abs(X - X_hat) / X, 2, mean) %>% 
+    .[!is.infinite(.) & !is.na(.)] %>% 
+    mean(.)
   
-  return(rmse)
-})
+  return(relativeError)
+}, cl = 6)
 
-errors3 <- lapply(clusters, function(clust){
+errors3 <- pblapply(clusters, function(clust){
   #create bulk matrix
   Y <- t(mrna)
   
@@ -967,21 +977,28 @@ errors3 <- lapply(clusters, function(clust){
   X_hat <- X_hat[,overlapGenes]
   X <- X[,overlapGenes]
   
-  #find RMSE between X and X'
-  rmse <- norm(X - X_hat, type = "f") / norm(X, type = "f")
+  #find relative error between X and X'
+  relativeError <- apply(abs(X - X_hat) / X, 2, mean) %>% 
+    .[!is.infinite(.) & !is.na(.)] %>% 
+    mean(.)
   
-  return(rmse)
-})
+  return(relativeError)
+}, cl = 6)
+
+#combine results into one matrix
+allErrors <- do.call("rbind", list(errors, errors2, errors3))
+rownames(allErrors) <- c("Pseudo-bulk Y", "Pseudo-bulk Y'", "Actual bulk")
+saveRDS(allErrors, "/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/relative_RMAD_constrained_OLS_nearPD.rds")
 ```
 
-```{r plotQPresults}
-allErrors <- readRDS("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/relative_RMSE_constrained_OLS.rds")
+```{r plotQPresults, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
+allErrors <- readRDS("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/relative_RMAD_constrained_OLS_nearPD.rds")
 matplot(t(allErrors), type = c("b"), pch = 1, col = 1:3, xlab = "Number of clusters", ylab = "Relative RMSE",
         main = "Solving constrained OLS using nearest positive-definite matrix", x = 5:15)
 legend("topleft", legend = rownames(allErrors), col=1:3, pch=1)
 ```
 
-```{r visualizeXhatHeatmapsQP, results = 'hide', fig.width=16}
+```{r visualizeXhatHeatmapsConstrainedOLSusingNearPD, results = 'hide', fig.width=16}
 #function to solve QP problem given A and Y
 computeSCprofiles <- function(bulk, timeProportions){
   
@@ -993,7 +1010,7 @@ computeSCprofiles <- function(bulk, timeProportions){
     Amat <- diag(ncol(timeProportions))
     
     #find nearest positive-definite matrix for D to be able to solve OLS problem
-    #Dmat <- as.matrix(Matrix::nearPD(Dmat)$mat)
+    Dmat <- as.matrix(Matrix::nearPD(Dmat)$mat)
     
     #add small scaling of the identitiy matrix to Dmat to make it positive definite
     #diag(Dmat) <- diag(Dmat)+1e-8
@@ -1010,9 +1027,7 @@ computeSCprofiles <- function(bulk, timeProportions){
 clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
 
 #create seurat object
-seurat <- createSeurat(scrna)
-
-#for(clust in clusters){
+#seurat <- createSeurat(scrna)
 
 clust <- clusters["9"]
 #cluster seurat object
@@ -1062,7 +1077,7 @@ X <- X[,overlapGenes]
 allX <- do.call("rbind", list(X, X_hat_Y, X_hat_Yhat, X_hat_bulk))
 
 #names of matrices
-matrixNames <- c("X (8 clusters)", "X predicted from pseudobulk Y", "X predicted from re-created pseudobulk Y'", "X predicted from actual bulk")
+matrixNames <- c("X (9 clusters)", "X predicted from pseudobulk Y", "X predicted from re-created pseudobulk Y'", "X predicted from actual bulk")
 
 #create heatmaps
 ComplexHeatmap::Heatmap(t(allX),
@@ -1073,9 +1088,166 @@ ComplexHeatmap::Heatmap(t(allX),
 
 ```
 
-As an alternative to the *nearPD* function, we add a small scaling of the identity matrix ($10^{-9}$) to $A^T A$, which will make it positive definite and allow *solve.QP* to work. The result is shown below.
+As an alternative to the *nearPD* function, we add a small scaling of the identity matrix ($10^{-9}$) to $A^T A$, which will make it positive definite and as such allow *solve.QP* to work. The result is shown below.
+
+```{r solveQPSmallScalingOfIdentityMatrix, results='hide', eval = FALSE}
+#function to predict single-cell profiles by adding small scaling of identity matrix
+computeSCprofiles <- function(bulk, timeProportions){
+  
+  #iterate over genes
+  sc <- apply(bulk, 2, function(gene){
+    #define required matrices/vectors for the quadratic solver
+    Dmat <- t(timeProportions) %*% timeProportions
+    dvec <- t(timeProportions) %*% gene
+    Amat <- diag(ncol(timeProportions))
+    
+    #find nearest positive-definite matrix for D to be able to solve OLS problem
+    #Dmat <- as.matrix(Matrix::nearPD(Dmat)$mat)
+    
+    #add small scaling of the identitiy matrix to Dmat to make it positive definite
+    diag(Dmat) <- diag(Dmat) + 1e-8
+    
+    #solve quadratic equation
+    qp <- quadprog::solve.QP(Dmat, dvec, Amat)
+    return(qp$solution)
+  })
+  
+  return(sc)
+}
+
+#compute distance between real matrix and predicted matrix for different number of Seurat clusters
+errors <- pblapply(clusters, function(clust){
+  #create pseudo-bulk matrix
+  Y <- t(createPseudoBulk(scrna))
+  
+  #cluster seurat object
+  seurat <- FindClusters(seurat, resolution = clust, random.seed = 123)
+  
+  #create matrix A with proportions of cell clusters in each timepoint
+  A <- computeCellProportions(seurat)
+  
+  #predict single-cell matrix X'
+  X_hat <- computeSCprofiles(bulk = Y, timeProportions = A)
+  
+  #construct matrix with cell-type expression of each gene
+  X <- scrna %>% 
+    mutate(gene = rownames(.)) %>% 
+    melt() %>% 
+    mutate(cell = Idents(seurat)[variable]) %>% 
+    group_by(gene, cell) %>% 
+    summarise(value = mean(value)) %>% 
+    dcast(gene ~ cell) %>% 
+    magrittr::set_rownames(.$gene) %>% 
+    select(-1) %>% 
+    as.matrix() %>% 
+    t()
+  
+  #make X and X' follow the same order
+  X <- X[,order(colnames(X))]
+  X_hat <- X_hat[,order(colnames(X_hat))]
+  
+  #find relative error between X and X'
+  relativeError <- apply(abs(X - X_hat) / X, 2, mean) %>% 
+    .[!is.infinite(.) & !is.na(.)] %>% 
+    mean(.)
+  
+  return(relativeError)
+}, cl = 6)
+
+#compute distance between real matrix and predicted matrix for different number of Seurat clusters
+errors2 <- pblapply(clusters, function(clust){
+  #cluster seurat object
+  seurat <- FindClusters(seurat, resolution = clust, random.seed = 123)
+  
+  #create matrix A with proportions of cell clusters in each timepoint
+  A <- computeCellProportions(seurat)
+  
+  #construct matrix with cell-type expression of each gene
+  X <- scrna %>% 
+    mutate(gene = rownames(.)) %>% 
+    melt() %>% 
+    mutate(cell = Idents(seurat)[variable]) %>% 
+    group_by(gene, cell) %>% 
+    summarise(value = mean(value)) %>% 
+    dcast(gene ~ cell) %>% 
+    magrittr::set_rownames(.$gene) %>% 
+    select(-1) %>% 
+    as.matrix() %>% 
+    t()
+  
+  #reconstruct bulk matrix
+  Y_hat <- A %*% X
+  
+  #predict single-cell matrix X'
+  X_hat <- computeSCprofiles(bulk = Y_hat, timeProportions = A)
+  
+  #make X and X' follow the same order
+  X <- X[,order(colnames(X))]
+  X_hat <- X_hat[,order(colnames(X_hat))]
+  
+  #find relative error between X and X'
+  relativeError <- apply(abs(X - X_hat) / X, 2, mean) %>% 
+    .[!is.infinite(.) & !is.na(.)] %>% 
+    mean(.)
+  
+  return(relativeError)
+}, cl = 6)
+
+errors3 <- pblapply(clusters, function(clust){
+  #create bulk matrix
+  Y <- t(mrna)
+  
+  #cluster seurat object
+  seurat <- FindClusters(seurat, resolution = clust, random.seed = 123)
+  
+  #create matrix A with proportions of cell clusters in each timepoint
+  A <- computeCellProportions(seurat)
+  
+  #predict single-cell matrix X'
+  X_hat <- computeSCprofiles(bulk = Y, timeProportions = A)
+  
+  #construct matrix with cell-type expression of each gene
+  X <- scrna %>% 
+    mutate(gene = rownames(.)) %>% 
+    melt() %>% 
+    mutate(cell = Idents(seurat)[variable]) %>% 
+    group_by(gene, cell) %>% 
+    summarise(value = mean(value)) %>% 
+    dcast(gene ~ cell) %>% 
+    magrittr::set_rownames(.$gene) %>% 
+    select(-1) %>% 
+    as.matrix() %>% 
+    t()
+  
+  #keep only the genes present in both datasets
+  overlapGenes <- intersect(colnames(X), colnames(X_hat))
+  X_hat <- X_hat[,overlapGenes]
+  X <- X[,overlapGenes]
+  
+  #find relative error between X and X'
+  relativeError <- apply(abs(X - X_hat) / X, 2, mean) %>% 
+    .[!is.infinite(.) & !is.na(.)] %>% 
+    mean(.)
+  
+  return(relativeError)
+}, cl = 6)
+
+#combine results into one matrix
+allErrors <- do.call("rbind", list(errors, errors2, errors3))
+rownames(allErrors) <- c("Pseudo-bulk Y", "Pseudo-bulk Y'", "Actual bulk")
+saveRDS(allErrors, "/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/relative_RMAD_constrained_OLS.rds")
+```
+
+```{r plotQPresultsWithScalingIdentityMatrix, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
+allErrors <- readRDS("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/relative_RMAD_constrained_OLS.rds")
+matplot(t(allErrors), type = c("b"), pch = 1, col = 1:3, xlab = "Number of clusters", ylab = "Relative error",
+        main = "Solving constrained OLS by adding small scaling of identity matrix", x = 5:15)
+legend("topleft", legend = rownames(allErrors), col=1:3, pch=1)
+```
+
 
 ```{r visualizeXhatHeatmapsQP2, results = 'hide', fig.width=16}
+#non-negative OLS by adding small scaling of identity matrix
 computeSCprofiles <- function(bulk, timeProportions){
   
   #iterate over genes
@@ -1103,11 +1275,9 @@ computeSCprofiles <- function(bulk, timeProportions){
 clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
 
 #create seurat object
-seurat <- createSeurat(scrna)
+#seurat <- createSeurat(scrna)
 
-#for(clust in clusters){
-
-clust <- clusters["8"]
+clust <- clusters["9"]
 #cluster seurat object
 seurat <- FindClusters(seurat, resolution = clust, random.seed = 123)
 
@@ -1155,7 +1325,7 @@ X <- X[,overlapGenes]
 allX <- do.call("rbind", list(X, X_hat_Y, X_hat_Yhat, X_hat_bulk))
 
 #names of matrices
-matrixNames <- c("X (8 clusters)", "X predicted from pseudobulk Y", "X predicted from re-created pseudobulk Y'", "X predicted from actual bulk")
+matrixNames <- c("X (9 clusters)", "X predicted from pseudobulk Y", "X predicted from re-created pseudobulk Y'", "X predicted from actual bulk")
 
 #create heatmaps
 ComplexHeatmap::Heatmap(t(allX),
@@ -1168,11 +1338,11 @@ ComplexHeatmap::Heatmap(t(allX),
 
 ## Predicting single-cell profiles using ridge regression
 
-The condition number of $A^TA$ for the case where we have 8 single-cell clusters, i.e. as many clusters as there are timepoints, is noticeably high (15,828) compared to a smaller number of clusters which suggests that it is a near-singular matrix. This would explain the relatively high error in estimating the single-cell profiles. In an attemp to address this, we use ridge regression to estimate the single-cell profiles instead.
+The condition number of $A^TA$ for the case where we have 8 single-cell clusters, i.e. as many clusters as there are timepoints, is noticeably high (15,828) compared to a smaller number of clusters which suggests that it is a near-singular matrix. This would explain the relatively high error in estimating the single-cell profiles. In an attempt to address this, we use ridge regression to estimate the single-cell profiles instead.
 
-Ridge regression is similar to linear regression but with the addition of a regularization term $\lambda$. A range of values for $\lambda$ are tested to decide on the optimal one. The R package *glmnet* is used for this task. We solve the problem by fitting a ridge regression model to each gene. The full procedure is outlined below:
+Ridge regression is similar to linear regression but with the addition of a regularization term $\lambda$. A range of values for $\lambda$ are tested to decide on the optimal one. The R package [*glmnet*](https://cran.r-project.org/web/packages/glmnet/glmnet.pdf) is used for this task. We solve the problem by fitting a ridge regression model to each gene. The full procedure is outlined below:
 
-[**Input:**]{.ul} Number of clusters *N,* Single-cell expression matrix *SC*
+[**Input:**]{.ul} Number of clusters *N*, Single-cell expression matrix *SC*
 
 [**Procedure:**]{.ul}
 
@@ -1184,7 +1354,7 @@ Ridge regression is similar to linear regression but with the addition of a regu
 
 4.  Construct timepoint \* gene pseudobulk matrix ***Y*** using the formula $Y = AX$
 
-5.  Define $LambdaSet = \{10^0,10^{1}, 10^{2}, 10^{3}, 10^{4}, 10^{-1}, 10^{-2}, 10^{-3}, 10^{-4}\}$
+5.  Define $LambdaSet = \{10^{-8}, 10^{-7}, 10^{-6}, 10^{-5}, 10^{-4}, 10^{-3}, 10^{-2}, 10^{-1}, 10^{0}, 10^{1} \}$
 
 6.  For each column of *Y,* denoted as *y* :
 
@@ -1202,12 +1372,15 @@ Ridge regression is similar to linear regression but with the addition of a regu
 
 4.  Select lambda with minimum accumulated error
 
-```{r ridgeRegression, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
+```{r ridgeRegression, fig.width = 12, fig.height = 8, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
 #list of resolutions for different numbers of seurat clusters
 clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
 
 #create seurat object
-seurat <- createSeurat(scrna)
+#seurat <- createSeurat(scrna)
+
+#set of lambdas to test for ridge regression (should be in decreasing order)
+lambdaSet <- sort(10^(-10:0), decreasing = TRUE)
 
 #compute distance between real matrix and predicted matrix for different number of Seurat clusters
 errors <- pblapply(clusters, function(clust){
@@ -1233,9 +1406,6 @@ errors <- pblapply(clusters, function(clust){
   #reconstruct bulk matrix
   Y <- A %*% X
   
-  #set of lambdas to test for ridge regression
-  lambdaSet <- 10^(4:-4)
-  
   #iterate over genes (columns of Y) and fit regression model based on counts of clusters in each timepoint
   ridge <- apply(Y, 2, function(y){
     #fit ridge regression model
@@ -1254,9 +1424,14 @@ errors <- pblapply(clusters, function(clust){
   })
   names(X_hat) <- lambdaSet
   
-  #compute squared error between X and X' for each lambda
+  #compute relative error between X and X' for each lambda
   error <- lapply(X_hat, function(cur_X_hat){
-    return(sum(colSums(abs(X - cur_X_hat))^2))
+    #find relative error between Y and Y'
+    relativeError <- apply(abs(X - cur_X_hat) / X, 2, mean) %>% 
+      .[!is.infinite(.) & !is.na(.)] %>% 
+      mean(.)
+    
+    return(relativeError)
   })
   
   #convert error values to matrix (one column per lambda)
@@ -1271,12 +1446,14 @@ rownames(errors) <- names(clusters)
 
 #convert to long format for plotting
 errors <- reshape2::melt(errors)
-colnames(errors) <- c("Number_of_clusters", "Lambda", "Sum_squared_error")
-errors$Number_of_clusters <- as.factor(errors$Number_of_clusters)
+colnames(errors) <- c("Number of clusters", "Lambda", "Relative error")
+errors$`Number of clusters` <- as.factor(errors$`Number of clusters`)
 
 #plot
-ggplot(errors, aes(x = log(Lambda), y = Sum_squared_error, col = Number_of_clusters)) +
+ggplot(errors, aes(x = log(Lambda), y = `Relative error`, col = `Number of clusters`)) +
   geom_line() + geom_point() +
+  scale_x_continuous("log(Lambda)", labels = paste0("log(", as.character(errors$Lambda), ")"), breaks = log(errors$Lambda)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
   labs(title = "Error of estimating single-cell profiles using ridge regression across values of lambda",
        subtitle = "Each color represents a pre-determined number of cell clusters")
 ```
@@ -1284,23 +1461,27 @@ ggplot(errors, aes(x = log(Lambda), y = Sum_squared_error, col = Number_of_clust
 For each number of clusters, we select the lambda which led to the minimal sum squared error when comparing the predicted single-cell profiles to the actual ones. Those selected lambdas are shown below.
 
 ```{r ridgeRegressionBestLambdas}
-#set of lambdas to test for ridge regression
-lambdaSet <- 10^(4:-4)
-
 #for each number of clusters, find optimal lambda
 bestLambdas <- errors %>% 
-  group_by(Number_of_clusters) %>%
-  summarise(best_lambda = lambdaSet[which(Sum_squared_error == min(Sum_squared_error))])
+  group_by(`Number of clusters`) %>%
+  summarise(`Best lambda` = lambdaSet[which(`Relative error` == min(`Relative error`))]) %>% 
+  mutate(`Best lambda` = as.character(signif(`Best lambda`, 3)))
 
 #show table with best lambda values
 kable(bestLambdas, caption = "Ridge regression - Lambda values that minimize error") %>%
   kable_styling(latex_options = c("striped", "hold_position")) %>% 
   row_spec(row = 0, bold = T, color = "white", background = "gray")
 ```
+\newpage 
 
-#### Comparing ridge regression to OLS
+#### Comparing ridge regression to OLS  
 
-```{r compareRidgeRegressionToOLS, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold', fig.width = 12}
+The below plots show a comparison of using ridge regression and non-negative constrained OLS for predicting the single-cell profiles from the bulk data and the timepoint-specific proportions.
+
+```{r compareRidgeRegressionToOLS, fig.width = 14, fig.height = 8, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
+#list of resolutions for different numbers of seurat clusters
+clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
+
 #predict X' using optimal lambda values for ridge regression
 X_hat_ridge <- pblapply(names(clusters), function(clust){
   #cluster seurat object
@@ -1326,7 +1507,7 @@ X_hat_ridge <- pblapply(names(clusters), function(clust){
   Y <- A %*% X
   
   #optimal lambda
-  lambda <- unlist(bestLambdas[as.character(bestLambdas$Number_of_clusters) == clust, "best_lambda"])
+  lambda <- as.numeric(unlist(bestLambdas[as.character(bestLambdas$`Number of clusters`) == clust, "Best lambda"]))
   
   #iterate over genes (columns of Y) and fit regression model based on counts of clusters in each timepoint
   ridge <- apply(Y, 2, function(y){
@@ -1345,26 +1526,23 @@ X_hat_ridge <- pblapply(names(clusters), function(clust){
   X <- X[,order(colnames(X))]
   X_hat <- X_hat[,order(colnames(X_hat))]
   
-  #find RMSE between X and X'
-  rmse <- norm(X - X_hat, type = "f") / norm(X, type = "f")
+  #find relative error between X and X'
+  relativeError <- apply(abs(X - X_hat) / X, 2, mean) %>% 
+    .[!is.infinite(.) & !is.na(.)] %>% 
+    mean(.)
   
-  return(rmse)
+  return(relativeError)
   
 }, cl = 6)
 
 #compute distance between real matrix and predicted matrix for different number of Seurat clusters
 X_hat_ols <- pblapply(clusters, function(clust){
-  #create pseudo-bulk matrix
-  Y <- t(createPseudoBulk(scrna))
   
   #cluster seurat object
   seurat <- FindClusters(seurat, resolution = clust, random.seed = 123)
   
   #create matrix A with proportions of cell clusters in each timepoint
   A <- computeCellProportions(seurat)
-  
-  #predict single-cell matrix X'
-  X_hat <- computeSCprofiles(bulk = Y, timeProportions = A)
   
   #construct matrix with cell-type expression of each gene
   X <- scrna %>% 
@@ -1379,14 +1557,23 @@ X_hat_ols <- pblapply(clusters, function(clust){
     as.matrix() %>% 
     t()
   
+  #reconstruct bulk matrix
+  Y <- A %*% X
+  
+  #predict single-cell matrix X'
+  X_hat <- computeSCprofiles(bulk = Y, timeProportions = A)
+  
   #make X and X' follow the same order
   X <- X[,order(colnames(X))]
   X_hat <- X_hat[,order(colnames(X_hat))]
   
-  #find RMSE between X and X'
-  rmse <- norm(X - X_hat, type = "f") / norm(X, type = "f")
+  #find relative error between X and X'
+  relativeError <- apply(abs(X - X_hat) / X, 2, mean) %>% 
+    .[!is.infinite(.) & !is.na(.)] %>% 
+    mean(.)
   
-  return(rmse)
+  return(relativeError)
+  
 }, cl = 6)
 
 #combine all the errors into one table
@@ -1396,23 +1583,23 @@ colnames(errors) <- c("Ridge regression", "OLS")
 
 #convert to long format for plotting
 errors <- reshape2::melt(errors)
-colnames(errors) <- c("Number_of_clusters", "Method", "Relative RMSE")
+colnames(errors) <- c("Number_of_clusters", "Method", "Relative error")
 
 #plot
-ggplot(errors, aes(x = Number_of_clusters, y = `Relative RMSE`, col = Method)) +
+ggplot(errors, aes(x = Number_of_clusters, y = `Relative error`, col = Method)) +
   geom_line() + geom_point() +
   scale_x_continuous(breaks = 5:15) +
-  labs(title = "Relative RMSE of estimating single-cell profiles for different numbers of clusters")
+  labs(title = "Relative error of estimating single-cell profiles for different numbers of clusters")
 ```
 ```{r visualizeXhatHeatmapsForRidgeAndOLS, results = 'hide', fig.width=16}
 #list of resolutions for different numbers of seurat clusters
 clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
 
 #create seurat object
-seurat <- createSeurat(scrna)
+#seurat <- createSeurat(scrna)
 
-#scenario with 8 clusters
-clust <- clusters["8"]
+#scenario with 10 clusters
+clust <- clusters["10"]
 
 #cluster seurat object
 seurat <- FindClusters(seurat, resolution = clust, random.seed = 123)
@@ -1443,7 +1630,7 @@ Y_hat <- A %*% X
 X_hat_ols <- computeSCprofiles(bulk = Y_hat, timeProportions = A)
 
 #optimal lambda
-lambda <- unlist(bestLambdas[as.character(bestLambdas$Number_of_clusters) == names(clust), "best_lambda"])
+lambda <- unlist(bestLambdas[as.character(bestLambdas$`Number of clusters`) == names(clust), "Best lambda"])
 
 #iterate over genes (columns of Y) and fit regression model based on counts of clusters in each timepoint
 ridge <- pbapply(Y, 2, function(y){
@@ -1468,7 +1655,7 @@ X <- X[,overlapGenes]
 allX <- as.matrix(do.call("rbind", list(X, X_hat_ols, X_hat_ridge)))
 
 #names of matrices
-matrixNames <- c("X (8 clusters)", "X predicted using OLS", "X predicted using Ridge Regression")
+matrixNames <- c("X (10 clusters)", "X predicted using OLS", "X predicted using Ridge Regression")
 
 #create heatmaps
 ComplexHeatmap::Heatmap(t(allX),
@@ -1478,4 +1665,370 @@ ComplexHeatmap::Heatmap(t(allX),
                         row_title = "Genes")
 
 ```
+
+## Ridge regression with non-negative constraint
+
+The results above do not show an improvement in the single-cell predictions when using ridge regression. In this section, we explore the addition of a non-negative constraint to the ridge regression model, similar to how we applied it for OLS earlier in this report. To achieve this, we solve the equation $\hat{X} = min_{x >= 0}(-2Y^T A X + X^T A^T A X)$ after adding a ridge penalty $\lambda$ to the diagonal of the matrix $A^TA$. The R function [*solve.QP*](https://www.rdocumentation.org/packages/quadprog/versions/1.5-8/topics/solve.QP) from the [*quadprog*](https://cran.r-project.org/web/packages/quadprog/quadprog.pdf) package is used to solve this equation one gene at a time to estimate the expression profile at the cell-type level. To decide on the optimal value for the parameter $\lambda$, we test a range of values between $10^{-10}$ and $1$ for each number of clusters. For each value of $\lambda$, we sum the errors in estimating each gene's single-cell profile as a measure of the accuracy of the predicted single-cell profiles. The $\lambda$ that leads to the minimal error is selected as the optimal value.
+
+```{r nonNegativeRidgeRegression, fig.width = 12, fig.height = 8, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
+#combine ridge regression with a non-negative constraint
+constrainedRidgeRegression <- function(bulk, timeProportions, lambda){
+  
+  #iterate over genes
+  sc <- apply(bulk, 2, function(gene){
+    #define required matrices/vectors for the quadratic solver
+    Dmat <- t(timeProportions) %*% timeProportions
+    dvec <- t(timeProportions) %*% gene
+    Amat <- diag(ncol(timeProportions))
+    
+    #find nearest positive-definite matrix for D to be able to solve OLS problem
+    #Dmat <- as.matrix(Matrix::nearPD(Dmat)$mat)
+    
+    #add small scaling of the identity matrix to Dmat to regularize prediction
+    Dmat <- Dmat + lambda*diag(nrow(Dmat))
+    
+    #solve quadratic equation
+    qp <- quadprog::solve.QP(Dmat, dvec, Amat)
+    return(qp$solution)
+  })
+  
+  return(sc)
+}
+
+#list of resolutions for different numbers of seurat clusters
+clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
+
+#set of lambdas to test for ridge regression (should be in decreasing order)
+lambdaSet <- sort(10^(-10:0), decreasing = TRUE)
+
+#create seurat object
+#seurat <- createSeurat(scrna)
+
+#compute distance between real matrix and predicted matrix for different number of Seurat clusters
+errors <- pblapply(clusters, function(clust){
+  #cluster seurat object
+  seurat <- FindClusters(seurat, resolution = clust, random.seed = 123)
+  
+  #construct matrix with cell-type expression of each gene
+  X <- scrna %>% 
+    mutate(gene = rownames(.)) %>% 
+    melt() %>% 
+    mutate(cell = Idents(seurat)[variable]) %>% 
+    group_by(gene, cell) %>% 
+    summarise(value = mean(value)) %>% 
+    dcast(gene ~ cell) %>% 
+    magrittr::set_rownames(.$gene) %>% 
+    select(-1) %>% 
+    as.matrix() %>% 
+    t()
+  
+  #create matrix A with proportions of cell clusters in each timepoint
+  A <- computeCellProportions(seurat)
+  
+  #reconstruct bulk matrix
+  Y <- A %*% X
+  
+  #predict single-cell profiles using constrained ridge regression for each value of lambda
+  X_hat <- lapply(lambdaSet, function(lambda){
+    return(constrainedRidgeRegression(bulk = Y, timeProportions = A, lambda = lambda))
+  })
+  names(X_hat) <- lambdaSet
+  
+  #compute relative error between X and X' for each lambda
+  error <- lapply(X_hat, function(cur_X_hat){
+    #find relative error between Y and Y'
+    relativeError <- apply(abs(X - cur_X_hat) / X, 2, mean) %>% 
+      .[!is.infinite(.) & !is.na(.)] %>% 
+      mean(.)
+    
+    return(relativeError)
+  })
+  
+  #convert error values to matrix (one column per lambda)
+  error <- do.call("cbind", error)
+  
+  return(error)
+}, cl = 6)
+
+#combine all the errors into one table
+errors <- do.call("rbind", errors)
+rownames(errors) <- names(clusters)
+
+#convert to long format for plotting
+errors <- reshape2::melt(errors)
+colnames(errors) <- c("Number of clusters", "Lambda", "Relative error")
+errors$`Number of clusters` <- as.factor(errors$`Number of clusters`)
+
+#plot
+ggplot(errors, aes(x = log(Lambda), y = `Relative error`, col = `Number of clusters`)) +
+  geom_line() + geom_point() +
+  scale_x_continuous("log(Lambda)", labels = paste0("log(", as.character(errors$Lambda), ")"), breaks = log(errors$Lambda)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(title = "Error of estimating single-cell profiles using constrained ridge regression across values of lambda",
+       subtitle = "Each color represents a pre-determined number of cell clusters")
+```
+
+
+For each number of clusters, we select the lambda which led to the minimal sum squared error when comparing the predicted single-cell profiles to the actual ones. Those selected lambdas are shown below.
+
+```{r constrainedRidgeRegressionBestLambdas}
+#for each number of clusters, find optimal lambda
+bestLambdas <- errors %>% 
+  group_by(`Number of clusters`) %>%
+  summarise(`Best lambda` = lambdaSet[which(`Relative error` == min(`Relative error`))]) %>% 
+  mutate(`Best lambda` = as.character(signif(`Best lambda`, 3)))
+
+#show table with best lambda values
+kable(bestLambdas, caption = "Constrained ridge regression - Lambda values that minimize error") %>%
+  kable_styling(latex_options = c("striped", "hold_position")) %>% 
+  row_spec(row = 0, bold = T, color = "white", background = "gray")
+```
+
+After selecting the optimal $\lambda$ for each number of clusters, we compare the results of using non-negative constrained ridge regression and OLS on predicting the single-cell profiles. The accuracy of recapturing the orignial single-cell profiles is measured by computing the relative RMSE between the predicted matrix and the original matrix by using the formula $||X - X'|| / ||X||$, where $||X||$ is the Frobenius norm of the matrix (the square root of the sum of squares of the matrix elements). The resultant relative RMSE values for each of the methods are shown below, along with an example predicted matrix.
+
+```{r compareConstrainedRidgeRegressionToOLS, fig.width = 14, fig.height = 8, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
+#list of resolutions for different numbers of seurat clusters
+clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
+
+#predict X' using optimal lambda values for constrained ridge regression
+X_hat_ridge <- pblapply(names(clusters), function(clust){
+  #cluster seurat object
+  seurat <- FindClusters(seurat, resolution = clusters[clust], random.seed = 123)
+  
+  #construct matrix with cell-type expression of each gene
+  X <- scrna %>% 
+    mutate(gene = rownames(.)) %>% 
+    melt() %>% 
+    mutate(cell = Idents(seurat)[variable]) %>% 
+    group_by(gene, cell) %>% 
+    summarise(value = mean(value)) %>% 
+    dcast(gene ~ cell) %>% 
+    magrittr::set_rownames(.$gene) %>% 
+    select(-1) %>% 
+    as.matrix() %>% 
+    t()
+  
+  #create matrix A with proportions of cell clusters in each timepoint
+  A <- computeCellProportions(seurat)
+  
+  #reconstruct bulk matrix
+  Y <- A %*% X
+  
+  #optimal lambda
+  lambda <- as.numeric(unlist(bestLambdas[as.character(bestLambdas$`Number of clusters`) == clust, "Best lambda"]))
+  
+  #predict single-cell profiles using constrained ridge regression for each value of lambda
+  X_hat <- constrainedRidgeRegression(bulk = Y, timeProportions = A, lambda = lambda)
+  
+  #make X and X' follow the same order
+  X <- X[,order(colnames(X))]
+  X_hat <- X_hat[,order(colnames(X_hat))]
+  
+  #find relative error between X and X'
+  relativeError <- apply(abs(X - X_hat) / X, 2, mean) %>% 
+    .[!is.infinite(.) & !is.na(.)] %>% 
+    mean(.)
+  
+  return(relativeError)
+}, cl = 6)
+
+#compute distance between real matrix and predicted matrix for different number of Seurat clusters
+X_hat_ols <- pblapply(clusters, function(clust){
+  
+  #cluster seurat object
+  seurat <- FindClusters(seurat, resolution = clust, random.seed = 123)
+  
+  #create matrix A with proportions of cell clusters in each timepoint
+  A <- computeCellProportions(seurat)
+  
+  #construct matrix with cell-type expression of each gene
+  X <- scrna %>% 
+    mutate(gene = rownames(.)) %>% 
+    melt() %>% 
+    mutate(cell = Idents(seurat)[variable]) %>% 
+    group_by(gene, cell) %>% 
+    summarise(value = mean(value)) %>% 
+    dcast(gene ~ cell) %>% 
+    magrittr::set_rownames(.$gene) %>% 
+    select(-1) %>% 
+    as.matrix() %>% 
+    t()
+  
+  #reconstruct bulk matrix
+  Y <- A %*% X
+  
+  #predict single-cell matrix X'
+  X_hat <- computeSCprofiles(bulk = Y, timeProportions = A)
+  
+  #make X and X' follow the same order
+  X <- X[,order(colnames(X))]
+  X_hat <- X_hat[,order(colnames(X_hat))]
+  
+  #find relative error between X and X'
+  relativeError <- apply(abs(X - X_hat) / X, 2, mean) %>% 
+    .[!is.infinite(.) & !is.na(.)] %>% 
+    mean(.)
+  
+  return(relativeError)
+}, cl = 6)
+
+#combine all the errors into one table
+errors <- do.call("cbind", list(do.call("rbind", X_hat_ridge), do.call("rbind", X_hat_ols)))
+rownames(errors) <- names(clusters)
+colnames(errors) <- c("Ridge regression", "OLS")
+
+#convert to long format for plotting
+errors <- reshape2::melt(errors)
+colnames(errors) <- c("Number_of_clusters", "Method", "Relative error")
+
+#plot
+ggplot(errors, aes(x = Number_of_clusters, y = `Relative error`, col = Method)) +
+  geom_line() + geom_point() +
+  scale_x_continuous(breaks = 5:15) +
+  labs(title = "Relative RMSE of estimating single-cell profiles for different numbers of clusters",
+       subtitle = "Non-negative constraint applied to both methods")
+```
+
+```{r visualizeXhatHeatmapsForConstrainedRidgeAndOLS, results = 'hide', fig.width=16}
+#list of resolutions for different numbers of seurat clusters
+clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
+
+#create seurat object
+seurat <- createSeurat(scrna)
+
+#scenario with 10 clusters
+clust <- clusters["10"]
+
+#cluster seurat object
+seurat <- FindClusters(seurat, resolution = clust, random.seed = 123)
+
+#get number of clusters
+nClust <- length(unique(Idents(seurat)))
+
+#create matrix A with proportions of cell clusters in each timepoint
+A <- computeCellProportions(seurat)
+
+#construct matrix with cell-type expression of each gene
+X <- scrna %>% 
+  mutate(gene = rownames(.)) %>% 
+  melt() %>% 
+  mutate(cell = Idents(seurat)[variable]) %>% 
+  group_by(gene, cell) %>% 
+  summarise(value = mean(value)) %>% 
+  dcast(gene ~ cell) %>% 
+  magrittr::set_rownames(.$gene) %>% 
+  select(-1) %>% 
+  as.matrix() %>% 
+  t()
+
+#reconstruct bulk matrix
+Y_hat <- A %*% X
+
+#predict single-cell matrix X' using OLS
+X_hat_ols <- computeSCprofiles(bulk = Y_hat, timeProportions = A)
+
+#optimal lambda
+lambda <- as.numeric(unlist(bestLambdas[as.character(bestLambdas$`Number of clusters`) == names(clust), "Best lambda"]))
+
+#predict single-cell matrix X' using ridge regression
+X_hat_ridge <- constrainedRidgeRegression(bulk = Y_hat, timeProportions = A, lambda = lambda)
+
+#keep only the genes present in all datasets
+overlapGenes <- intersect(colnames(X), colnames(X_hat_ols))
+X_hat_ols <- X_hat_ols[,overlapGenes]
+X_hat_ridge <- X_hat_ridge[,overlapGenes]
+X <- X[,overlapGenes]
+
+#put into one table
+allX <- as.matrix(do.call("rbind", list(X, X_hat_ols, X_hat_ridge)))
+
+#names of matrices
+matrixNames <- c("X (10 clusters)", "X predicted using OLS", "X predicted using Ridge Regression")
+
+#create heatmaps
+ComplexHeatmap::Heatmap(t(allX),
+                        name = "Counts", cluster_columns = FALSE, cluster_rows = T,
+                        column_split = rep(matrixNames, each = nClust), use_raster = T, 
+                        show_row_names = F, show_column_names = F, 
+                        row_title = "Genes")
+
+```
+
+## Distribution of errors across genes
+
+In this section, we explore whether a *partial prediction* might be more feasible, that is whether the single-cell predictions might be more accurate for a subset of the genes, such as differential markers, by comparing the distributions of prediction errors for individual genes as they relate to cell-type expression specificity.
+
+```{r partialPredictions}
+#function for performing ridge regression with a non-negative constraint
+constrainedRidgeRegression <- function(bulk, timeProportions, lambda){
+  
+  #iterate over genes
+  sc <- apply(bulk, 2, function(gene){
+    #define required matrices/vectors for the quadratic solver
+    Dmat <- t(timeProportions) %*% timeProportions
+    dvec <- t(timeProportions) %*% gene
+    Amat <- diag(ncol(timeProportions))
+    
+    #find nearest positive-definite matrix for D to be able to solve OLS problem
+    #Dmat <- as.matrix(Matrix::nearPD(Dmat)$mat)
+    
+    #add small scaling of the identity matrix to Dmat to regularize prediction
+    Dmat <- Dmat + lambda*diag(nrow(Dmat))
+    
+    #solve quadratic equation
+    qp <- quadprog::solve.QP(Dmat, dvec, Amat)
+    return(qp$solution)
+  })
+  
+  return(sc)
+}
+
+#list of resolutions for different numbers of seurat clusters
+clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
+
+#predict X' using optimal lambda values for constrained ridge regression
+X_hat_ridge <- pblapply(names(clusters), function(clust){
+  #cluster seurat object
+  seurat <- FindClusters(seurat, resolution = clusters[clust], random.seed = 123)
+  
+  #construct matrix with cell-type expression of each gene
+  X <- scrna %>% 
+    mutate(gene = rownames(.)) %>% 
+    melt() %>% 
+    mutate(cell = Idents(seurat)[variable]) %>% 
+    group_by(gene, cell) %>% 
+    summarise(value = mean(value)) %>% 
+    dcast(gene ~ cell) %>% 
+    magrittr::set_rownames(.$gene) %>% 
+    select(-1) %>% 
+    as.matrix() %>% 
+    t()
+  
+  #create matrix A with proportions of cell clusters in each timepoint
+  A <- computeCellProportions(seurat)
+  
+  #reconstruct bulk matrix
+  Y <- A %*% X
+  
+  #optimal lambda
+  lambda <- as.numeric(unlist(bestLambdas[as.character(bestLambdas$Number_of_clusters) == clust, "best_lambda"]))
+  
+  #predict single-cell profiles using constrained ridge regression for each value of lambda
+  X_hat <- constrainedRidgeRegression(bulk = Y, timeProportions = A, lambda = lambda)
+  
+  #make X and X' follow the same order
+  X <- X[,order(colnames(X))]
+  X_hat <- X_hat[,order(colnames(X_hat))]
+  
+  #compute error between X and X' for each gene
+  error <- apply((abs(X - X_hat) / X), 2, mean)
+  
+  
+  
+  return(error)
+  
+}, cl = 6)
+```
+
+
 
