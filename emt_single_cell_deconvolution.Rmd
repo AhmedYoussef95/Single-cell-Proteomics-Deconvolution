@@ -44,14 +44,8 @@ Epithelial-to-mesenchymal transition (EMT) is a biological process in which epit
 
 # Approach
 
-Bulk proteomics data gives a view of the aggregated protein abundance from all cell types within a sequenced sample. Using single-cell data, derived from the same samples, we can investigate the sample heterogeneity by estimating proportions of cell types within a bulk sample. We cannot reliably use these proportions to directly estimate the contribution of each population to each gene/protein's expression at the bulk-level however, since there is low correlation between RNA and protein levels of the same genes due to multiple biological factors such as alternative splicing and post-translational modifications. Leveraging the timepoints present in this dataset, which conveniently show shifts in cell type abundances across time, we can instead look for changes in cell-type proportions and corresponding changes in bulk-level protein abundance as suggestive of relationships between specific cell types and specific proteins. This information can then potentially be used to estimate the contribution of individual cell types to the bulk proteomics measurements.
+Bulk proteomics data gives a view of the aggregated protein abundance from all cell types within a sequenced sample. Using single-cell data, derived from the same samples, we can investigate the sample heterogeneity by estimating proportions of cell types within the bulk sample. We cannot reliably use these proportions to directly estimate the contribution of each population to each gene/protein's expression at the bulk-level however, since there is low correlation between RNA and protein levels of the same genes due to multiple biological factors, such as alternative splicing and post-translational modifications. Leveraging the timepoints present in this dataset, which conveniently show shifts in cell type abundances across time, we can instead look for changes in cell-type proportions and corresponding changes in bulk-level protein abundance as suggestive of relationships between specific cell types and specific proteins. This information can then potentially be used to estimate the contribution of individual cell types to the bulk proteomics measurements.
 
-The step-by-step process is outlined below:
-
-1)  Pool together all single cells across timepoints into one scRNA-Seq dataset
-2)  Cluster the pooled scRNA data to identify cell states
-3)  Compute proportion of each cell state in each timepoint using the cluster labels derived from the pooled data
-4)  For each gene-cell state pairing, compute the Pearson correlation coefficient between the 8 timepoint proteomics measurements (gene) and the cell cluster proportions (scRNA)
 
 # Data summary - Proteomics
 
@@ -1885,7 +1879,7 @@ colnames(errors) <- c("Number_of_clusters", "Method", "Relative error")
 ggplot(errors, aes(x = Number_of_clusters, y = `Relative error`, col = Method)) +
   geom_line() + geom_point() +
   scale_x_continuous(breaks = 5:15) +
-  labs(title = "Relative RMSE of estimating single-cell profiles for different numbers of clusters",
+  labs(title = "Relative error of estimating single-cell profiles for different numbers of clusters",
        subtitle = "Non-negative constraint applied to both methods")
 ```
 
@@ -2052,13 +2046,15 @@ expression_plot <- ggplot(predictions, aes(x = Av_expression, y = Error)) +
 
 CV_plot / expression_plot
 ```
+
 ## Evaluation of single-cell predictions
+
 
 The below sections examine the accuracy of the single-cell predictions made using ridge regression in the previous section. Note: the bulk matrix that is deconvoluted in this section is the reconstructed pseudo-bulk matrix ($Y=AX$).
 
 #### Are our predicted cluster centroids close to the real ones?
 
-The cluster centroid is each cluster’s average gene expression profile. Visualizing the two sets of centroids (real & predicted) side-by-side on a *UMAP* will help us answer this question. For each number of clusters between 5 and 15, we cluster the data using *Seurat* and construct the matrix $X$ which contains the average gene expression by cluster. We then use the ridge regression approach defined in the previous section to construct the matrix $X'$. Finally, we perform a *UMAP* projection using the R package [umap][https://cran.r-project.org/web/packages/umap/vignettes/umap.html] on the original gene expression matrix but with the addition of the real and predicted cluster centroids, i.e. the rows of $X$ and $X'$. The *UMAP*s below show the projections for each number of clusters.
+The cluster centroid is each cluster’s average gene expression profile. Visualizing the two sets of centroids (real & predicted) side-by-side on a *UMAP* will help us answer this question. For each number of clusters between 5 and 15, we cluster the data using *Seurat* and construct the matrix $X$ which contains the average gene expression by cluster. We then use the ridge regression approach defined in the previous section to construct the matrix $X'$. Finally, we perform a *UMAP* projection using the R package [umap](https://cran.r-project.org/web/packages/umap/vignettes/umap.html) on the original gene expression matrix but with the addition of the real and predicted cluster centroids, i.e. the rows of $X$ and $X'$. The *UMAP*s below show the projections for each number of clusters.
 
 ```{r UMAPpredictedVsRealCentroids, eval = FALSE}
 #for each no. of clusters, construct UMAP
@@ -2137,7 +2133,8 @@ ggplot(mergedUmap, aes(x = V1, y = V2, col = centroid)) +
   ggtitle("UMAP visualization of the predicted cell cluster centroids relative to the predicted ones")
 ```
 
-#### How similar is the average cell to it's real centroid compared to the predicted one?
+#### How similar is the average cell to it's real centroid compared to the predicted one?  
+
 
 To determine if our predictions are reasonable approximations of the real data, we also compare the predictions to the real data by computing the Euclidean distance between individual cells’ measurements and their real cluster average as opposed to the distance between our predictions and the same cluster average.
 
@@ -2226,11 +2223,12 @@ ggplot(centroidDistances, aes(x = Cluster, y = Distance, fill = Type)) +
   coord_flip()
 ```
 
-#### Which clusters are easier to predict?
+#### Which clusters are easier to predict?  
+
 
 We compute the correlation between how ’tightly-knit’ a cluster is, i.e. average within-cluster distance to the centroid, and the error in predicting the profiles. The error in this case is taken as the Euclidean distance between the cluster's predicted centroid and the actual centroid.
 
-```{r correlationOfClusterTightnessToError}
+```{r correlationOfClusterTightnessToError, fig.width = 12, fig.height = 8, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
 #compute correlations from results of the section comparing centroids
 centroidErrors <- centroidDistances[centroidDistances$Type == "Predicted centroid", "Distance"]
 clusterTightness <- centroidDistances[centroidDistances$Type == "Average cell", "Distance"]
@@ -2244,8 +2242,13 @@ ggplot(forPlot, aes(x = Average_within_cluster_distance, y = Distance_between_re
   ggpubr::stat_cor(method = "pearson") +
   labs(title = "Relationship between a cluster's tightness and prediction errors")
 ```
+#### How does the optimal regression parameter change for different categories of genes?
 
+We group the genes according to how variable they are across clusters and compute and compare the optimal regression parameter for each of the groups.
 
+```{r lambdaChangesInValue}
+
+```
 
 
 
