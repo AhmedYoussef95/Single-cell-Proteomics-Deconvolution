@@ -149,7 +149,7 @@ mrna <- read.delim("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/
 
 The Venn diagram below shows the overlap of the identified proteins in the datasets.
 
-```{r proteinOverlap, fig.height = 4, fig.width = 5}
+```{r proteinOverlap, fig.height = 4, fig.width = 7}
 #list of genes detected in each dataset
 allGenes <- list("scRNA-Seq" = rownames(scrna), "Proteomics" = rownames(proteome), "Bulk mRNA" = rownames(mrna))
 
@@ -193,7 +193,7 @@ To summarize, the following three matrices represent the key variables in our mo
 
 We then attempt to re-create the single-cell matrix $X'$ data by computing $Y = AX'$.
 
-# Results
+# Method Development and Optimization
 
 The key input parameter for the deconvolution algorithm is the regularization parameter $\lambda$ for solving the ridge regression problem. After selecting the optimal $\lambda$ for each number of clusters we report the errors as relative RMAD (relative mean absolute deviation) using the formula $|X - X'| / X$, where $|X|$ is the absolute value of the difference. This error is computed for each gene and the final reported score is the average RMAD value, in other words: *on average, how different is a gene's predicted values compared to the true ones?* The resultant relative RMAD values are shown below,
 
@@ -439,6 +439,7 @@ ggplot(X_hat_ridge, aes(x = Number_of_clusters, y = `Relative error`)) +
   scale_x_continuous(breaks = 5:15) +
   labs(title = "Relative error of estimating single-cell profiles for different numbers of clusters")
 ```
+
 ## Distribution of errors across genes
 
 This section explores whether the single-cell predictions might be more accurate for a subset of the genes, such as differential markers, by comparing the distributions of prediction errors for individual genes as they relate to cell-type expression specificity.
@@ -538,7 +539,7 @@ expression_plot <- ggplot(predictions, aes(x = Av_expression, y = Error)) +
 CV_plot / expression_plot
 ``` 
 
-
+\newpage
 ## Evaluation of single-cell predictions
 
 
@@ -762,3 +763,178 @@ p1|p2|p3
 ```
 
 
+# Algorithm Results
+
+The previous sections in this report optimized the deconvolution algorithm by using only the single-cell RNA-Seq data. This section applies the resultant deconvolution algorithm to the following 4 bulk datasets:
+
+1) ***Pseudo-bulk***: A pseudo-bulk RNA dataset is created for each timepoint by summing the gene counts of all cells within the timepoint.
+2) ***Reconstructed Pseudo-bulk***: The reconstructed pseudo-bulk is created by matrix multiplication of the average cell cluster expression of each gene and the number of cells in each cluster each timepoint, i.e. $Y = AX$.
+3) ***Bulk mRNA***: Bulk mRNA data from a microarray experiment.
+4) ***Proteomics***: Bulk proteomics data from a mass spectrometry experiment.
+
+For each of the above datasets, we apply the deconvolution algorithm and compute the prediction error as the relative error between our predicted cell-cluster matrix $X'$ and the one obtained from the Seurat clustering of the scRNA data $X$. Since the identified genes differ across the three technologies, we retain only the ~5,000 genes common to all datasets for this comparison.
+
+```{r applyDeconvolutionToDifferentBulkDatasets, fig.width = 16, fig.height = 10}
+#combine ridge regression with a non-negative constraint
+constrainedRidgeRegression <- function(bulk, timeProportions, lambda){
+  #define required matrices/vectors for the quadratic solver
+  Dmat <- t(timeProportions) %*% timeProportions
+  Amat <- diag(ncol(timeProportions))
+  
+  #add small scaling of the identity matrix to Dmat to regularize prediction
+  Dmat <- Dmat + lambda*diag(nrow(Dmat))
+  
+  #to avoid overflow cause by large values, scale Dmat and dvec
+  scalingFactor <- norm(Dmat, "2")
+  
+  #iterate over genes
+  sc <- apply(bulk, 2, function(gene){
+    #define required matrices/vectors for the quadratic solver
+    dvec <- t(timeProportions) %*% gene
+    
+    #solve quadratic equation
+    qp <- quadprog::solve.QP(Dmat / scalingFactor, dvec / scalingFactor, Amat)
+    return(qp$solution)
+  })
+  
+  return(sc)
+}
+
+#list of resolutions for different numbers of seurat clusters
+clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
+
+#set of lambdas to test for ridge regression (sorted in descending order)
+lambdaSet <- 10^(-10:10)
+
+#create seurat object
+seurat <- createSeurat(scrna)
+
+#compute distance between real matrix and predicted matrix for different number of Seurat clusters and different values of lambda (~2m)
+results <- pblapply(names(clusters), function(clust){
+  #cluster seurat object
+  seurat <- FindClusters(seurat, resolution = clusters[clust], random.seed = 123)
+  
+  #construct matrix with cell-type expression of each gene
+  X <- scrna %>% 
+    mutate(gene = rownames(.)) %>% 
+    melt() %>% 
+    mutate(cell = Idents(seurat)[variable]) %>% 
+    group_by(gene, cell) %>% 
+    summarise(value = mean(value)) %>% 
+    dcast(gene ~ cell) %>% 
+    magrittr::set_rownames(.$gene) %>% 
+    select(-1) %>% 
+    as.matrix() %>% 
+    t()
+  
+  #create matrix A with proportions of cell clusters in each timepoint
+  A <- computeCellProportions(seurat)
+  
+  #construct pseudo-bulk matrix
+  pseudobulk <- t(createPseudoBulk(scrna = scrna))
+  
+  #reconstruct pseudo-bulk matrix
+  Y <- A %*% X
+  
+  #bulk mRNA matrix
+  bulk_RNA <- t(mrna)
+  
+  #bulk proteomics matrix
+  bulk_proteomics <- t(proteome)
+  
+  #list of overlapping genes
+  overlapGenes <- Reduce(intersect, allGenes)
+  
+  #retain overlapping genes only in the datasets
+  X <- X[,overlapGenes]
+  pseudobulk <- pseudobulk[,overlapGenes]
+  Y <- Y[,overlapGenes]
+  bulk_proteomics <- bulk_proteomics[,overlapGenes]
+  bulk_RNA <- bulk_RNA[,overlapGenes]
+  
+  #re-scale proteomics data to be comparable to RNA
+  bulk_proteomics <- bulk_proteomics / (sum(bulk_proteomics) / sum(Y))
+  
+  #create list of bulk datasets
+  bulkDatasets <- list("Pseudobulk" = pseudobulk, "Reconstructed pseudobulk" = Y,
+                       "Bulk mRNA" = bulk_RNA, "Proteomics" = bulk_proteomics)
+  
+  #construct matrix with all pairings of lambda and bulk datasets
+  parameters <- expand.grid(names(bulkDatasets), lambdaSet) %>% 
+    set_colnames(c("Bulk dataset", "Lambda"))
+  
+  #predict single-cell profiles using constrained ridge regression for each value of lambda
+  X_hat <- apply(parameters, 1, function(pairing){
+    #extract current parameters
+    lambda <- as.numeric(pairing[["Lambda"]])
+    bulk <- bulkDatasets[[pairing[["Bulk dataset"]]]]
+    
+    #predict single-cell profiles
+    prediction <- constrainedRidgeRegression(bulk = bulk, timeProportions = A, lambda = lambda)
+    
+    #compute relative error between prediction and real matrix
+    relativeError <- apply(abs(X - prediction) / X, 2, mean) %>% 
+      .[!is.infinite(.) & !is.na(.)] %>% 
+      mean(.)
+    
+    #compute relative error between bulk data and reconstructed pseudobulk
+    bulkError <- apply(abs(Y - bulk) / Y, 2, mean) %>% 
+      .[!is.infinite(.) & !is.na(.)] %>% 
+      mean(.)
+    
+    return(data.frame(Bulk_dataset = pairing[["Bulk dataset"]], Lambda = lambda,
+                      Number_of_clusters = clust, Relative_error = relativeError,
+                      Bulk_difference = bulkError))
+  }) %>% 
+    do.call("rbind", .)
+  
+  return(X_hat)
+}, cl = 6) %>% 
+  do.call("rbind", .)
+
+
+#plot lambda values and their corresponding error for deconvoluting each bulk dataset
+ggplot(results, aes(x = log(Lambda), y = Relative_error, col = Number_of_clusters)) +
+  geom_line() + geom_point() +
+  facet_wrap(~ Bulk_dataset, scales = "free") +
+  scale_x_continuous("log(Lambda)", labels = paste0("log(", as.character(results$Lambda), ")"), breaks = log(results$Lambda)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(title = "Error of estimating single-cell profiles using ridge regression across values of lambda",
+       subtitle = "Each color represents a pre-determined number of cell clusters")
+
+#for each number of clusters, find optimal lambda
+bestLambdas <- results %>% 
+  group_by(Number_of_clusters, Bulk_dataset) %>%
+  filter(Relative_error == min(Relative_error)) %>% 
+  mutate(Number_of_clusters = as.integer(Number_of_clusters))
+
+#plot relative error for each dataset after selecting optimal lambda parameters
+ggplot(bestLambdas, aes(x = Number_of_clusters, y = Relative_error, col = Bulk_dataset)) +
+  geom_line() + geom_point() +
+  scale_x_continuous(breaks = 5:15) +
+  labs(title = "Relative error of estimating single-cell profiles for different numbers of clusters",
+       subtitle = "Predictions by ridge regression using optimal lambda value")
+```
+
+### Accounting for differences in experimental technologies
+
+The errors computed in the previous section compared the predicted single-cell profiles to those derived from scRNA-Seq without accounting for the fact that the bulk mRNA and proteomics data were obtained from different technologies, namely microarray and mass spectrometry, which introduce their own technical noise. Indeed, even the pseudobulk that was reconstructed from the scRNA-Seq data after clustering differs from the actual summed-up measurements from the raw data. To account for these differences, we find the relative error between each of the bulk datasets and the "reconstructed" pseudobulk that was used to optimize the algorithm. By plotting that difference on the same plot as the prediction errors, we can place the prediction errors within the context of the underlying experimental differences. For example, in the case of proteomics it would correspond to adjusting the prediction error based on the discrepancy between the protein and RNA levels.
+
+```{r accountForTechnologyDifferences, fig.width = 16}
+#subset values to optimal lambda values and exclude reconstructed pseudobulk from comparison
+techDifferences <- results %>% 
+  group_by(Number_of_clusters, Bulk_dataset) %>%
+  filter(Relative_error == min(Relative_error) & !Bulk_dataset == "Reconstructed pseudobulk") %>% 
+  set_colnames(c("Bulk_dataset", "Lambda", "Number_of_clusters", "Prediction_error", "Bulk_difference")) %>% 
+  mutate(Number_of_clusters = as.integer(Number_of_clusters)) %>% 
+  melt(., id = c("Bulk_dataset", "Number_of_clusters", "Lambda"))
+
+#plot prediction errors for each bulk dataset alongside technology differences
+ggplot(techDifferences, aes(x = Number_of_clusters, y = value, col = variable)) +
+  geom_line() + geom_point() +
+  facet_wrap(~ Bulk_dataset) +
+  scale_x_continuous(breaks = 5:15) +
+  labs(title = "Precition error of single-cell profiles compared to error between sequencing technolgies",
+       subtitle = "Predictions by ridge regression using optimal lambda value")
+
+```
