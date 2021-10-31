@@ -1986,8 +1986,8 @@ lambdaSet <- sort(10^(-10:10), decreasing = TRUE)
 #create seurat object
 #seurat <- createSeurat(scrna)
 
-#compute distance between real matrix and predicted matrix for different number of Seurat clusters
-errors <- pblapply(names(clusters), function(clust){
+#compute distance between real matrix and predicted matrix for different number of Seurat clusters (~11m)
+geneLambdas <- pblapply(names(clusters), function(clust){
   #cluster seurat object
   seurat <- FindClusters(seurat, resolution = clusters[clust], random.seed = 123)
   
@@ -2047,19 +2047,29 @@ errors <- pblapply(names(clusters), function(clust){
     #solve quadratic equation
     prediction <- quadprog::solve.QP(Dmat / scalingFactor, dvec / scalingFactor, Amat)$solution
     
+    #set names of prediction to clusters
+    names(prediction) <- paste0("cluster_", 0:(length(prediction) - 1))
+    
     #compute relative error between prediction and real values
     curParameters$Relative_error <- mean(abs(X[, curParameters[["Gene"]]] - prediction) / X[, curParameters[["Gene"]]])
+    
+    #add the predicted value to the table
+    curParameters <- cbind(curParameters, data.frame(t(prediction)))
     
     return(as.data.frame(curParameters))
   }) %>% 
     do.call("rbind", .)
   
   return(X_hat)
-}, cl = 6) %>% 
-  do.call("rbind", .)
+}, cl = 6)
 
-errors$Lambda <- as.numeric(errors$Lambda)
-saveRDS(errors, "/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/geneLambdas.rds")
+#,erge all results into one table
+# get all variable names
+allNms <- unique(unlist(lapply(geneLambdas, names)))
+geneLambdas <- do.call(rbind, c(lapply(geneLambdas, function(x) data.frame(c(x, sapply(setdiff(allNms, names(x)), function(y) NA)))), make.row.names=FALSE))
+
+geneLambdas$Lambda <- as.numeric(geneLambdas$Lambda)
+saveRDS(geneLambdas, "/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/geneLambdas.rds")
 ```
 
 ```{r lambdaForDifferentGenes, fig.width = 16, fig.height = 16}
@@ -2706,7 +2716,7 @@ Here, we examine an alternative clustering of the data, which clustered the scRN
 monocle <- read.delim("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/scRNAseq - 22 monocle clusters.txt")
 monocle <- setNames(monocle$clusters.HSMM., monocle$cells)
 Idents(seurat) <- monocle
-  
+
 #plot UMAP
 DimPlot(seurat, reduction = "umap", label = T) + ggtitle("Monocle-identified cell clusters")
 
@@ -2799,10 +2809,351 @@ pheatmap(t(prediction), scale = "row", show_rownames = F, cluster_cols = F, main
 pheatmap(t(prediction_hallmark), scale = "row", show_rownames = T, cluster_cols = F, main = "Single-cell proteomics prediction - Monocle 20 clusters - EMT hallmark genes", cluster_rows = T)
 ```
 
+# Modified Algorithm - tuning lambda to individual genes
 
-# Deconvolution of proteomics data - tuning lambda to individual genes
+This section introduces a modification to the algorithm by tuning the regression parameter $\lambda$ to each individual gene's prediction. For each gene, we test the prediction accuracy of 21 values of $\lambda$ (ranging from 1e−10 to 1e10) for deconvoluting reconstructed pseudobulk RNA data to the single-cell level, with the scRNA data being the benchmark value. The value of $\lambda$ that minimized the error to the scRNA profiles is retained as the optimal value.
 
-In this section of the report, we once agin focus on deconvoluting the bulk proteomics data with 11 Seurat-defined clusters, with a focus on a set of 80 hallmark genes associated with EMT from the [MSigDB database](https://www.gsea-msigdb.org/gsea/msigdb/cards/HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION.html). This time, we fine-tune the regression parameter $\lambda$ to individual genes.
+After selecting the optimal $\lambda$ for each gene and each number of clusters we report the errors as relative RMAD (relative mean absolute deviation) using the formula $|X - X'| / X$, where $|X|$ is the absolute value of the difference. This error is computed for each gene and the final reported score is the average RMAD value, in other words: *on average, how different is a gene's predicted values compared to the true ones?* The resultant relative RMAD values are shown below.
+
+```{r individualGeneLambdasErrors, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
+#read in all scores for all values of lambda and all genes
+geneLambdas <- readRDS("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/geneLambdas.rds")
+
+#subset to optimal lambdas
+optimalLambdas <- geneLambdas %>% 
+  group_by(Gene, Number_of_clusters) %>% 
+  filter(Relative_error == min(Relative_error)) %>% 
+  filter(!is.infinite(Relative_error))
+
+#average errors for each number of clusters
+errors <- optimalLambdas %>% 
+  group_by(Number_of_clusters) %>% 
+  summarise(Relative_error = mean(Relative_error))
+
+#visualize errors with line plots
+ggplot(errors, aes(x = Number_of_clusters, y = Relative_error)) +
+  geom_line() + geom_point() +
+  scale_x_continuous(breaks = 5:15) +
+  labs(title = "Relative error of estimating single-cell profiles for different numbers of clusters")
+```
+
+## Distribution of errors across genes
+
+This section explores whether the single-cell predictions might be more accurate for a subset of the genes, such as differential markers, by comparing the distributions of prediction errors for individual genes as they relate to cell-type expression specificity.
+
+To explore the relationship between properties of the genes and their corresponding predicted values, for each gene we compute the following measures:
+
+-   ***Expression specificity:*** This metric looks at the relative specificity of a given gene's expression to the clusters. The coefficient of variation of the gene's cluster-specific expression values is computed as the standard deviation of the per-cluster expression values divided by the mean.
+
+-   ***Average expression:*** This metric is concerned with the relative abundance of each gene's transcript, and is simply computed as the mean expression of the gene across clusters.
+
+Each of the above measures are then compared to the error in predicting the gene's expression value using regression.
+
+```{r distributionOfErrorsAcrossGenes, fig.width = 16, fig.height = 16}
+#list of resolutions for different numbers of seurat clusters
+clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
+
+#for each no. of clusters, get each gene's error, specificity, and average expression
+predictions <- pblapply(names(clusters), function(clust){
+  #get error values for current no. of clusters
+  curErrors <- optimalLambdas[optimalLambdas$Number_of_clusters == as.numeric(clust),]
+  
+  #cluster seurat object
+  seurat <- FindClusters(seurat, resolution = clusters[clust], random.seed = 123)
+  
+  #construct matrix with cell-type expression of each gene
+  X <- scrna %>% 
+    mutate(gene = rownames(.)) %>% 
+    melt() %>% 
+    mutate(cell = Idents(seurat)[variable]) %>% 
+    group_by(gene, cell) %>% 
+    summarise(value = mean(value)) %>% 
+    dcast(gene ~ cell) %>% 
+    magrittr::set_rownames(.$gene) %>% 
+    select(-1) %>% 
+    as.matrix() %>% 
+    t()
+  
+  #keep genes for which the error is not infinity
+  X <- X[,colnames(X) %in% curErrors$Gene]
+  
+  #find error for each gene
+  error <- unlist(lapply(colnames(X), function(gene){
+    return(unlist(curErrors[curErrors$Gene == gene, "Relative_error"]))
+  }))
+  
+  #compute each gene's coeff. of variation across cell types
+  cv <- apply(X, 2, function(gene){
+    return(sd(gene) / mean(gene))
+  })
+  
+  #compute each gene's average expression value
+  average_expression <- colMeans(X)
+  
+  #construct table with all values of interest to return
+  toReturn <- data.frame(Gene = colnames(X),
+                         Number_of_clusters = as.numeric(clust),
+                         Error = error,
+                         Coef_variation = cv,
+                         Av_expression = average_expression)
+  return(toReturn)
+  
+}, cl = 6)
+names(predictions) <- paste(names(clusters), "clusters")
+
+#convert list into data frame
+predictions <- do.call("rbind", predictions)
+
+#remove 'infinite' entries (dividing by zero)
+predictions <- predictions[!is.infinite(predictions$Error),] %>% 
+  .[complete.cases(.),]
+
+#correlation plots of errors for each number of clusters
+CV_plot <- ggplot(predictions, aes(x = Coef_variation, y = Error)) +
+  geom_point() +
+  geom_smooth(method = lm) +
+  facet_wrap(~ Number_of_clusters, scales = "free") +
+  ggpubr::stat_cor(method = "pearson") +
+  labs(title = "Relationship between a gene's cluster specificity and prediction errors",
+       subtitle = "Each box represents a pre-defined number of clusters")
+
+expression_plot <- ggplot(predictions, aes(x = Av_expression, y = Error)) +
+  geom_point() +
+  geom_smooth(method = lm) +
+  facet_wrap(~ Number_of_clusters, scales = "free") +
+  ggpubr::stat_cor(method = "pearson") +
+  labs(title = "Relationship between a gene's average expression and prediction errors",
+       subtitle = "Each box represents a pre-defined number of clusters")
+
+CV_plot / expression_plot
+``` 
+\newpage
+## Evaluation of single-cell predictions
+
+
+The below sections examine the accuracy of the single-cell predictions made using ridge regression in the previous section. Note: the bulk matrix that is deconvoluted in this section is the reconstructed pseudo-bulk matrix ($Y=AX$).
+
+#### Are our predicted cluster centroids close to the real ones?
+
+The cluster centroid is each cluster’s average gene expression profile. Visualizing the two sets of centroids (real & predicted) side-by-side on a *UMAP* will help us answer this question. For each number of clusters between 5 and 15, we cluster the data using *Seurat* and construct the matrix $X$ which contains the average gene expression by cluster. We then use the ridge regression approach defined in the previous section to construct the matrix $X'$. Finally, we perform a *UMAP* projection using the R package [uwot](https://github.com/jlmelville/uwot) on the original gene expression matrix but with the addition of the real and predicted cluster centroids, i.e. the rows of $X$ and $X'$. The *UMAP*s below show the projections for each number of clusters.
+
+```{r UMAPpredictedVsRealCentroids, eval = FALSE}
+#for each no. of clusters, construct UMAP
+umapList <- pblapply(names(clusters), function(clust){
+  #get error values for current no. of clusters
+  curErrors <- optimalLambdas[optimalLambdas$Number_of_clusters == as.numeric(clust),]
+  
+  #cluster seurat object
+  seurat <- FindClusters(seurat, resolution = clusters[clust], random.seed = 123)
+  
+  #construct matrix with cell-type expression of each gene
+  X <- scrna %>% 
+    mutate(gene = rownames(.)) %>% 
+    melt() %>% 
+    mutate(cell = Idents(seurat)[variable]) %>% 
+    group_by(gene, cell) %>% 
+    summarise(value = mean(value)) %>% 
+    dcast(gene ~ cell) %>% 
+    magrittr::set_rownames(.$gene) %>% 
+    select(-1) %>% 
+    as.matrix() %>% 
+    t()
+  
+  #get predicted values for current gene
+  X_hat <- curErrors %>% 
+    as.data.frame() %>% 
+    set_rownames(.$Gene) %>% 
+    select(grep("^cluster_", colnames(.))) %>% 
+    t() %>% 
+    .[complete.cases(.),]
+  
+  #sort matrices to all follow the same order of genes
+  overlapGenes <- Reduce(intersect, list(rownames(scrna), colnames(X), colnames(X_hat)))
+  scrna <- scrna[overlapGenes, ]
+  X <- X[, overlapGenes]
+  X_hat <- X_hat[, overlapGenes]
+  
+  #concatenate centroids to single-cell expression matrix
+  mergedSC <- rbind(t(scrna), X, X_hat)
+  
+  #UMAP
+  set.seed(123)
+  umap <- as.data.frame(uwot::umap(mergedSC))
+  
+  #add label indicating whether point is a centroid
+  umap$centroid <- c(rep("cell", ncol(scrna)), rep("real centroid", nrow(X)), rep("predicted centroid", nrow(X_hat)))
+  
+  #add label indicating the no. of cluster for this UMAP
+  umap$number_of_clusters <- paste(clust, "clusters")
+  
+  #add label indicating cell cluster
+  umap$cluster <- c(rep(NA, ncol(scrna)), rep(1:nrow(X), 2))
+  
+  return(umap)
+}, cl = 6)
+
+#merge all results into one table
+mergedUmap <- do.call("rbind", umapList)
+
+#save locally
+saveRDS(mergedUmap, "/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/updated_UMAP_list_sc_predictions.rds")
+```
+
+```{r UMAPcomparisonOfPredcitions, fig.width = 16, fig.height = 16}
+#read in pre-computed UMAP projections
+mergedUmap <- readRDS("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/updated_UMAP_list_sc_predictions.rds")
+
+#plot
+ggplot(mergedUmap, aes(x = V1, y = V2, col = centroid)) +
+  geom_point() +
+  geom_label(label = mergedUmap$cluster) + 
+  facet_wrap( ~ number_of_clusters) + 
+  scale_color_manual(values = c("grey", "red", "blue"), name = "Key") +
+  theme_classic2() +
+  ggtitle("UMAP visualization of the predicted cell cluster centroids relative to the predicted ones")
+```
+
+#### How similar is the average cell to it's real centroid compared to the predicted one?  
+
+To determine if our predictions are reasonable approximations of the real data, we also compare the predictions to the real data by computing the Euclidean distance between individual cells’ measurements and their real cluster average as opposed to the distance between our predictions and the same cluster average.
+
+More specifically, for a given number of clusters, we cluster the data using *Seurat*, followed by iterating over each of the ~1,900 cells in the original single-cell expression matrix and computing the Euclidean distance between it's profile and that of its cluster's centroid. Next, for each cluster we compute the average distance of it's cells to the centroid, as well as the distance between our predicted centroid and the corresponding cluster centroid. By comparing these two distances side-by-side, we can determine whether our predicted centroids fall within the correct intra-cluster range.
+
+```{r distancesBetweenCellsAndCentroids, , fig.width = 16, fig.height = 16}
+#for each no. of clusters, predict X' and find average distance between cells and their centroids
+centroidDistances <- pblapply(names(clusters), function(clust){
+  #get error values for current no. of clusters
+  curErrors <- optimalLambdas[optimalLambdas$Number_of_clusters == as.numeric(clust),]
+  
+  #cluster seurat object
+  seurat <- FindClusters(seurat, resolution = clusters[clust], random.seed = 123)
+  
+  #construct matrix with cell-type expression of each gene
+  X <- scrna %>% 
+    mutate(gene = rownames(.)) %>% 
+    melt() %>% 
+    mutate(cell = Idents(seurat)[variable]) %>% 
+    group_by(gene, cell) %>% 
+    summarise(value = mean(value)) %>% 
+    dcast(gene ~ cell) %>% 
+    magrittr::set_rownames(.$gene) %>% 
+    select(-1) %>% 
+    as.matrix() %>% 
+    t()
+  
+  #get predicted values for current gene
+  X_hat <- curErrors %>% 
+    as.data.frame() %>% 
+    set_rownames(.$Gene) %>% 
+    select(grep("^cluster_", colnames(.))) %>% 
+    t() %>% 
+    .[complete.cases(.),]
+  
+  #create matrix A with proportions of cell clusters in each timepoint
+  A <- computeCellProportions(seurat)
+  
+  #sort matrices to all follow the same order of genes
+  overlapGenes <- Reduce(intersect, list(rownames(scrna), colnames(X), colnames(X_hat)))
+  scrna <- scrna[overlapGenes, ]
+  X <- X[, overlapGenes]
+  X_hat <- X_hat[, overlapGenes]
+  
+  #break up single-cell expression matrix by cluster and compare to centroids
+  clusterDistances <- lapply(sort(unique(Idents(seurat))), function(curCluster){
+    #get counts for cells belonging to this cluster
+    curCounts <- t(scrna[, Idents(seurat) == curCluster])
+    
+    #get centroid belonging to this cluster
+    curCentroid <- X[curCluster,]
+    
+    #compute distances between each cell and the corresponding centroid
+    curDistances <- apply(curCounts, 1, function(cell){
+      return(sqrt(sum((cell - curCentroid)^2)))
+    })
+    
+    #get average distance
+    averageDistance <- mean(curDistances, na.rm = TRUE)
+    
+    #find distance between predicted centroid and real centroid
+    centroidDistance <- sqrt(sum((curCentroid - X_hat[curCluster,])^2))
+    
+    #return table with distances
+    toReturn <- data.frame(Type = c("Average cell", "Predicted centroid"),
+                           Distance = c(averageDistance, centroidDistance),
+                           Number_of_cells = nrow(curCounts),
+                           Cluster = curCluster)
+  })
+  
+  #find coefficient of variation for each cluster's proportion across timepoints
+  proportions <- A / rowSums(A)
+  cvProportions <- apply(proportions, 2, function(curCluster) return(sd(curCluster) / mean(curCluster)))
+  clusterDistances <- lapply(seq_along(cvProportions), function(curTable){
+    clusterDistances[[curTable]]$Cell_type_proportion_variation <- cvProportions[curTable]
+    return(clusterDistances[[curTable]])
+  })
+  
+  #merge results from all clusters into one table
+  clusterDistances <- do.call("rbind", clusterDistances)
+  
+  #add column indicating the number of clusters
+  clusterDistances$Number_of_clusters <- paste(clust, "clusters")
+  
+  return(clusterDistances)
+}, cl = 6)
+
+#merge results into one table
+centroidDistances <- do.call("rbind", centroidDistances)
+
+#plot bar plot
+ggplot(centroidDistances, aes(x = Cluster, y = Distance, fill = Type)) + 
+  geom_bar(stat = "identity", position = "dodge", width = .5) +
+  facet_wrap( ~ Number_of_clusters, scales = "free") +
+  labs(title = "Average Euclidean distance between each cluster's cells and it's centroid compared to the predicted centroid")+
+  theme_bw() +
+  coord_flip()
+```
+
+#### Which clusters are easier to predict?  
+
+The accuracy of recapturing the cell cluster profiles varied by cluster. In this section, we are interested in examining the mathematical properties of the cell clusters derived from the scRNA-Seq data that influence the quality of our predictions. We first compute the correlation between how ’tightly-knit’ a cluster is, i.e. average within-cluster distance to the centroid, and the error in predicting the profiles. We also correlate the prediction error with the number of cells in each cluster and the variation of each cell type's proportion across timepoints. The error in this section is taken as the Euclidean distance between the cluster's predicted centroid and the actual centroid.
+
+```{r correlationOfClusterTightnessToError, fig.width = 20, fig.height = 8}
+#compute correlations from results of the section comparing centroids
+centroidErrors <- centroidDistances[centroidDistances$Type == "Predicted centroid", "Distance"]
+clusterTightness <- centroidDistances[centroidDistances$Type == "Average cell", "Distance"]
+clusterSizes <- centroidDistances[centroidDistances$Type == "Average cell", "Number_of_cells"]
+clusterVariations <- centroidDistances[centroidDistances$Type == "Average cell", "Cell_type_proportion_variation"]
+
+forPlot <- data.frame("Distance_between_real_and_predicted_centroid" = centroidErrors,
+                      "Average_within_cluster_distance" = clusterTightness,
+                      "Number_of_cells" = clusterSizes,
+                      "Cell_type_proportion_variation" = clusterVariations)
+
+#plots
+p1 <- ggplot(forPlot, aes(x = Average_within_cluster_distance, y = Distance_between_real_and_predicted_centroid)) +
+  geom_point() +
+  geom_smooth(method = lm) +
+  ggpubr::stat_cor(method = "pearson") +
+  labs(title = "Relationship between a cluster's tightness and prediction errors", subtitle = "Each point represents a cluster")
+
+p2 <- ggplot(forPlot, aes(x = Number_of_cells, y = Distance_between_real_and_predicted_centroid)) +
+  geom_point() +
+  geom_smooth(method = lm) +
+  ggpubr::stat_cor(method = "pearson") +
+  labs(title = "Relationship between a cluster's size and prediction errors", subtitle = "Each point represents a cluster")
+
+p3 <- ggplot(forPlot, aes(x = Cell_type_proportion_variation, y = Distance_between_real_and_predicted_centroid)) +
+  geom_point() +
+  geom_smooth(method = lm) +
+  ggpubr::stat_cor(method = "pearson") +
+  labs(title = "Relationship between a cluster's proportion variation across timepoints and prediction errors", subtitle = "Each point represents a cluster")
+
+p1|p2|p3
+```
+
+## Deconvolution of proteomics data - tuning lambda to individual genes
+
+In this section of the report, we once again focus on deconvoluting the bulk proteomics data with 11 Seurat-defined clusters, with a focus on a set of 80 hallmark genes associated with EMT from the [MSigDB database](https://www.gsea-msigdb.org/gsea/msigdb/cards/HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION.html). This time, we fine-tune the regression parameter $\lambda$ to individual genes.
 
 For each gene, we test the prediction accuracy of 21 values of $\lambda$ (ranging from $1e^{-10}$ to $1e^{10}$) for deconvoluting pseudobulk RNA data to the single-cell level, with the scRNA data being the benchmark value. The value of $\lambda$ that minimized the error to the scRNA profiles is retained as the optimal value.
 
