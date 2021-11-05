@@ -3500,7 +3500,7 @@ matrixNames <- c("scRNA profiles X (11 clusters)", "X predicted from pseudobulk"
 #create heatmaps
 ComplexHeatmap::Heatmap(t(allX),
                         name = "Counts", cluster_columns = FALSE, cluster_rows = TRUE,
-                        column_split = rep(matrixNames, each = nClust), use_raster = T, 
+                        column_split = rep(matrixNames, each = as.integer(clust)), use_raster = T, 
                         show_row_names = F, show_column_names = F, 
                         row_title = "Genes")
 ```
@@ -3523,7 +3523,7 @@ allX <- do.call("rbind", list(X, X_hat_Y, X_hat_Yhat, X_hat_bulk))
 #create heatmaps
 ComplexHeatmap::Heatmap(t(allX),
                         name = "Counts", cluster_columns = FALSE, cluster_rows = TRUE,
-                        column_split = rep(matrixNames, each = nClust), use_raster = T, 
+                        column_split = rep(matrixNames, each = as.integer(clust)), use_raster = T, 
                         show_row_names = F, show_column_names = F, 
                         row_title = "Genes")
 
