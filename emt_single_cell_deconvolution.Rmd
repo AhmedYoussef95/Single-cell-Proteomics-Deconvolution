@@ -17,6 +17,7 @@ library(kableExtra) #for tables
 library(dplyr) #data wrangling
 library(magrittr) #data wrangling
 library(reshape2) #data wrangling
+library(purrr) #data wrangling
 library(tidyr) #data wrangling
 library(tibble) #data wrangling
 library(ggplot2) #plots
@@ -32,6 +33,7 @@ library(quadprog) #solving constrained OLS problem
 library(glmnet) #ridge regression
 library(pbapply) # parallel operations
 library(ggpubr) #correlation plots annotation
+library(enrichR) #pathway enrichment analysis
 ```
 
 # Introduction
@@ -428,12 +430,12 @@ createSeurat <- function(counts){
 }
 
 #function to compute cell-type proportions 'A' given seurat-clustered data
-computeCellProportions <- function(seurat){
+computeCellProportions <- function(seuratObject){
   #construct matrix with number of cells from each type in each timepoint
-  A <- as.data.frame(seurat@assays$RNA@counts) %>% 
+  A <- as.data.frame(seuratObject@assays$RNA@counts) %>% 
     mutate(gene = rownames(.)) %>% 
     melt() %>% 
-    mutate(cluster = Idents(seurat)[variable], timepoint = gsub(".*_","", variable)) %>% 
+    mutate(cluster = Idents(seuratObject)[variable], timepoint = gsub(".*_","", variable)) %>% 
     group_by(cluster, timepoint) %>% 
     summarize(count = length(unique(variable))) %>% 
     tidyr::spread(key = cluster, value = count, fill = 0) %>% 
@@ -2022,6 +2024,9 @@ lambdaSet <- sort(10^(-10:10), decreasing = TRUE)
 #create seurat object
 #seurat <- createSeurat(scrna)
 
+#read in pre-computed log-fold change values for each gene
+allLogFC <- readRDS("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/allFoldChanges.rds")
+
 #compute distance between real matrix and predicted matrix for different number of Seurat clusters (~11m)
 geneLambdas <- pblapply(names(clusters), function(clust){
   #cluster seurat object
@@ -2047,14 +2052,62 @@ geneLambdas <- pblapply(names(clusters), function(clust){
   Y <- A %*% X
   
   #compute coefficient of variation of genes across clusters
-  geneCV <- apply(X, 2, function(x) return(sd(x) / mean(x)))
+  geneCV_clusters <- apply(X, 2, function(x) return(sd(x) / mean(x)))
   
-  #group genes into 3 groups according to variance across clusters
-  geneCV <- split(sort(geneCV), sort(1:length(geneCV) %% 3))
-  names(geneCV) <- c("Low variation", "Medium variation", "High variation")
+  #group genes into groups according to variance across clusters
+  geneCV_clusters_groups <- split(sort(geneCV_clusters), sort(1:length(geneCV_clusters) %% 30))
   
-  #create table with each gene's variation classification
-  geneVarClass <- do.call("rbind", lapply(names(geneCV), function(x) return(data.frame(Gene = names(geneCV[[x]]), Cross_cluster_variation = x))))
+  #names(geneCV_groups) <- c("Low variation", "Medium variation", "High variation")
+  
+  #create table with each gene's CV and variation classification
+  clusterCVClass <- do.call("rbind", lapply(names(geneCV_clusters_groups),
+                                            function(x) return(data.frame(Gene = names(geneCV_clusters_groups[[x]]),
+                                                                          Cross_cluster_CV_class = x,
+                                                                          Cross_cluster_CV = geneCV_clusters[names(geneCV_clusters_groups[[x]])]))))
+  
+  #compute coefficient of variation of genes across timepoints
+  geneCV_timepoints <- apply(Y, 2, function(x) return(sd(x) / mean(x)))
+  
+  #group genes into groups according to variance across clusters
+  geneCV_timepoints_groups <- split(sort(geneCV_timepoints), sort(1:length(geneCV_timepoints) %% 30))
+  
+  #create table with each gene's CV and variation classification
+  timepointCVClass <- do.call("rbind", lapply(names(geneCV_timepoints_groups),
+                                              function(x) return(data.frame(Gene = names(geneCV_timepoints_groups[[x]]),
+                                                                            Cross_timepoint_CV_class = x,
+                                                                            Cross_timepoint_CV = geneCV_timepoints[names(geneCV_timepoints_groups[[x]])]))))
+  
+  #compute average expression across timepoints
+  av_expression <- apply(Y, 2, function(x) return(mean(x)))
+  
+  #group genes into groups based on order of average expression
+  av_expression_groups <- split(sort(av_expression), sort(1:length(av_expression) %% 30))
+  
+  #create table with each gene's average expression and classification
+  avExpressionClass <- do.call("rbind", lapply(names(av_expression_groups),
+                                               function(x) return(data.frame(Gene = names(av_expression_groups[[x]]),
+                                                                             Average_expression_class = x,
+                                                                             Average_expression = av_expression[names(av_expression_groups[[x]])]))))
+  
+  #extract pre-computed log fold-change scores for genes
+  curLogFC <- allLogFC[[clust]] %>% 
+    #mutate(avg_log2FC = abs(avg_log2FC)) %>% 
+    group_by(gene) %>% 
+    filter(avg_log2FC == max(avg_log2FC)[1])
+  
+  geneLogFC <- setNames(curLogFC$avg_log2FC, curLogFC$gene)
+  
+  #group genes into groups according to logFC
+  geneLogFC_groups <- split(sort(geneLogFC), sort(1:length(geneLogFC) %% 30))
+  
+  #create table with each gene's CV and variation classification
+  geneLogFcClass <- do.call("rbind", lapply(names(geneLogFC_groups),
+                                            function(x) return(data.frame(Gene = names(geneLogFC_groups[[x]]),
+                                                                          Log_FC_class = x,
+                                                                          Max_Log_FC = geneLogFC[names(geneLogFC_groups[[x]])]))))
+  
+  #merge dataframes with gene properties into one
+  geneVarClass <- list(clusterCVClass, timepointCVClass, avExpressionClass, geneLogFcClass) %>% purrr::reduce(left_join, by = "Gene")
   
   #construct matrix with all combinations of lambda and gene name and gene variation
   parameters <- merge(geneVarClass, data.frame(Lambda = lambdaSet, Number_of_clusters = clust), by = NULL)
@@ -2087,7 +2140,7 @@ geneLambdas <- pblapply(names(clusters), function(clust){
     names(prediction) <- paste0("cluster_", 0:(length(prediction) - 1))
     
     #compute relative error between prediction and real values
-    curError <- abs(X[, curParameters[["Gene"]]] - prediction) / X[, curParameters[["Gene"]]]
+    curError <- abs(X[, curParameters[["Gene"]] ] - prediction) / X[, curParameters[["Gene"]] ]
     curParameters$Relative_error <- mean(curError[!is.infinite(curError)])
     
     #add the predicted value to the table
@@ -2106,6 +2159,14 @@ allNms <- unique(unlist(lapply(geneLambdas, names)))
 geneLambdas <- do.call(rbind, c(lapply(geneLambdas, function(x) data.frame(c(x, sapply(setdiff(allNms, names(x)), function(y) NA)))), make.row.names=FALSE))
 
 geneLambdas$Lambda <- as.numeric(geneLambdas$Lambda)
+geneLambdas$Max_Log_FC <- as.numeric(geneLambdas$Max_Log_FC)
+geneLambdas$Cross_cluster_CV <- as.numeric(geneLambdas$Cross_cluster_CV)
+geneLambdas$Cross_timepoint_CV <- as.numeric(geneLambdas$Cross_timepoint_CV)
+geneLambdas$Number_of_clusters <- as.integer(geneLambdas$Number_of_clusters)
+geneLambdas$Cross_cluster_CV_class <- as.integer(geneLambdas$Cross_cluster_CV_class)
+geneLambdas$Cross_timepoint_CV_class <- as.integer(geneLambdas$Cross_timepoint_CV_class)
+geneLambdas$Average_expression_class <- as.integer(geneLambdas$Average_expression_class)
+geneLambdas$Log_FC_class <- as.integer(geneLambdas$Log_FC_class)
 saveRDS(geneLambdas, "/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/geneLambdas.rds")
 ```
 
@@ -2115,144 +2176,71 @@ geneLambdas <- readRDS("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/D
 
 #keep optimal lambda for each gene
 forPlot <- geneLambdas %>% 
-  filter(Dataset == "Reconstructed pseudobulk") %>% 
   group_by(Gene, Number_of_clusters) %>% 
   filter(Relative_error == min(Relative_error)) %>% 
-  arrange(Number_of_clusters) %>% 
-  mutate(Number_of_clusters = factor(paste(Number_of_clusters, "clusters")), Lambda = as.numeric(Lambda),
-         Cross_cluster_variation = factor(Cross_cluster_variation, levels = c("Low variation", "Medium variation", "High variation")))
+  mutate(Number_of_clusters = factor(paste(Number_of_clusters, "clusters")), Lambda = as.numeric(Lambda))
 
 #plot
 ggplot(forPlot) +
-  geom_boxplot(aes(x = Cross_cluster_variation, y = log(Lambda), fill = Cross_cluster_variation)) +
+  geom_boxplot(aes(x = factor(Cross_cluster_CV_class), y = log(Lambda)), fill = "skyblue") +
   #scale_y_continuous(limits = quantile(log(geneLambdas$Lambda), c(0.1,0.9))) +
   #scale_y_continuous("log(Lambda)", labels = paste0("log(", as.character(geneLambdas$Lambda), ")"), breaks = log(geneLambdas$Lambda)) +
   facet_wrap( ~ Number_of_clusters) + 
   labs(title = "How does the optimal regression parameter vary for different categories of genes?",
-       subtitle = "Variation of gene's expression across clusters")
-
+       subtitle = "Variation of gene's expression across clusters", x = "Cross cluster CV") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
 ```
 
 We repeat the same process as above, except this time grouping the genes based on their variability across **timepoints** in the reconstructed pseudobulk data.
 
-```{r computeLambdaForDifferentGenesBasedOnVariabilityTimepoints, eval = FALSE}
-#list of resolutions for different numbers of seurat clusters
-clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
-
-#set of lambdas to test for ridge regression (should be in decreasing order)
-lambdaSet <- sort(10^(-10:10), decreasing = TRUE)
-
-#create seurat object
-#seurat <- createSeurat(scrna)
-
-#compute distance between real matrix and predicted matrix for different number of Seurat clusters (~11m)
-timeGeneLambdas <- pblapply(names(clusters), function(clust){
-  #cluster seurat object
-  seurat <- FindClusters(seurat, resolution = clusters[clust], random.seed = 123)
-  
-  #construct matrix with cell-type expression of each gene
-  X <- scrna %>% 
-    mutate(gene = rownames(.)) %>% 
-    melt() %>% 
-    mutate(cell = Idents(seurat)[variable]) %>% 
-    group_by(gene, cell) %>% 
-    summarise(value = mean(value)) %>% 
-    dcast(gene ~ cell) %>% 
-    magrittr::set_rownames(.$gene) %>% 
-    select(-1) %>% 
-    as.matrix() %>% 
-    t()
-  
-  #create matrix A with proportions of cell clusters in each timepoint
-  A <- computeCellProportions(seurat)
-  
-  #reconstruct bulk matrix
-  Y <- A %*% X
-  
-  #compute coefficient of variation of genes across clusters
-  geneCV <- apply(Y, 2, function(x) return(sd(x) / mean(x)))
-  
-  #group genes into 3 groups according to variance across clusters
-  geneCV <- split(sort(geneCV), sort(1:length(geneCV) %% 3))
-  names(geneCV) <- c("Low variation", "Medium variation", "High variation")
-  
-  #create table with each gene's variation classification
-  geneVarClass <- do.call("rbind", lapply(names(geneCV), function(x) return(data.frame(Gene = names(geneCV[[x]]), Cross_timepoint_variation = x))))
-  
-  #construct matrix with all combinations of lambda and gene name and gene variation
-  parameters <- merge(geneVarClass, data.frame(Lambda = lambdaSet, Number_of_clusters = clust), by = NULL)
-  
-  #define required matrices/vectors for the quadratic solver
-  Dmat <- t(A) %*% A
-  Amat <- diag(ncol(A))
-  
-  #predict single-cell profiles using constrained ridge regression for each value of lambda
-  X_hat <- apply(parameters, 1, function(curParameters){
-    #extract current parameters
-    lambda <- as.numeric(curParameters[["Lambda"]])
-    curGene <- Y[, curParameters[["Gene"]]]
-    
-    ##predict single-cell profiles
-    
-    #add small scaling of the identity matrix to Dmat to regularize prediction
-    Dmat <- Dmat + lambda*diag(nrow(Dmat))
-    
-    #to avoid overflow cause by large values, scale Dmat and dvec
-    scalingFactor <- norm(Dmat, "2")
-    
-    #define required matrices/vectors for the quadratic solver
-    dvec <- t(A) %*% curGene
-    
-    #solve quadratic equation
-    prediction <- quadprog::solve.QP(Dmat / scalingFactor, dvec / scalingFactor, Amat)$solution
-    
-    #set names of prediction to clusters
-    names(prediction) <- paste0("cluster_", 0:(length(prediction) - 1))
-    
-    #compute relative error between prediction and real values
-    curError <- abs(X[, curParameters[["Gene"]]] - prediction) / X[, curParameters[["Gene"]]]
-    curParameters$Relative_error <- mean(curError[!is.infinite(curError)])
-    
-    #add the predicted value to the table
-    curParameters <- cbind(curParameters, data.frame(t(prediction)))
-    
-    return(as.data.frame(curParameters))
-  }) %>% 
-    do.call("rbind", .)
-  
-  return(X_hat)
-}, cl = 6)
-
-#merge all results into one table
-# get all variable names
-allNms <- unique(unlist(lapply(timeGeneLambdas, names)))
-timeGeneLambdas <- do.call(rbind, c(lapply(timeGeneLambdas, function(x) data.frame(c(x, sapply(setdiff(allNms, names(x)), function(y) NA)))), make.row.names=FALSE))
-
-timeGeneLambdas$Lambda <- as.numeric(timeGeneLambdas$Lambda)
-timeGeneLambdas$Number_of_clusters <- as.numeric(timeGeneLambdas$Number_of_clusters)
-saveRDS(timeGeneLambdas, "/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/crossTimepointGeneLambdas.rds")
-```
 
 ```{r lambdaForDifferentGenesCrossTimepointVariability, fig.width = 16, fig.height = 16}
 #read in all scores for all values of lambda and all genes
-timeGeneLambdas <- readRDS("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/crossTimepointGeneLambdas.rds")
+#geneLambdas <- readRDS("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/geneLambdas.rds")
 
 #keep optimal lambda for each gene
-forPlot <- timeGeneLambdas %>% 
+forPlot <- geneLambdas %>% 
   group_by(Gene, Number_of_clusters) %>% 
   filter(Relative_error == min(Relative_error)) %>% 
-  arrange(Number_of_clusters) %>% 
-  mutate(Number_of_clusters = factor(paste(Number_of_clusters, "clusters")), Lambda = as.numeric(Lambda),
-         Cross_timepoint_variation = factor(Cross_timepoint_variation, levels = c("Low variation", "Medium variation", "High variation")))
+  mutate(Number_of_clusters = factor(paste(Number_of_clusters, "clusters")), Lambda = as.numeric(Lambda))
 
 #plot
 ggplot(forPlot) +
-  geom_boxplot(aes(x = Cross_timepoint_variation, y = log(Lambda), fill = Cross_timepoint_variation)) +
+  geom_boxplot(aes(x = factor(Cross_timepoint_CV_class), y = log(Lambda)), fill = "skyblue") +
   #scale_y_continuous(limits = quantile(log(geneLambdas$Lambda), c(0.1,0.9))) +
+  #scale_y_continuous("log(Lambda)", labels = paste0("log(", as.character(geneLambdas$Lambda), ")"), breaks = log(geneLambdas$Lambda)) +
   facet_wrap( ~ Number_of_clusters) + 
   labs(title = "How does the optimal regression parameter vary for different categories of genes?",
-       subtitle = "Variation of gene's expression across timepoints")
+       subtitle = "Variation of gene's expression across timepoints", x = "Cross timepoint CV") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
 
+We repeat the same process as above, except this time grouping the genes based on the magnitude of their average expression across timepoints.
+
+
+```{r lambdaForDifferentGenesAverageTimepointExpression, fig.width = 16, fig.height = 16}
+#plot
+ggplot(forPlot) +
+  geom_boxplot(aes(x = factor(Average_expression_class), y = log(Lambda)), fill = "skyblue") +
+  #scale_y_continuous(limits = quantile(log(geneLambdas$Lambda), c(0.1,0.9))) +
+  #scale_y_continuous("log(Lambda)", labels = paste0("log(", as.character(geneLambdas$Lambda), ")"), breaks = log(geneLambdas$Lambda)) +
+  facet_wrap( ~ Number_of_clusters) + 
+  labs(title = "How does the optimal regression parameter vary for different categories of genes?",
+       subtitle = "Average of gene's expression across timepoints", x = "Average expression") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
+We repeat the same process as above, except this time grouping the genes based on the maximum cross-cluster log-fold change. The log fold-change for each gene in each cluster was computed using *Seurat*'s $FindAllMarkers()$ function. The final retained log fold-change is the maximum one for the gene across clusters.
+
+```{r lambdaForDifferentGenesAverageLogFoldChange, fig.width = 16, fig.height = 16}
+#plot
+ggplot(forPlot) +
+  geom_boxplot(aes(x = factor(Log_FC_class), y = log(Lambda)), fill = "skyblue") +
+  #scale_y_continuous(limits = quantile(log(geneLambdas$Lambda), c(0.1,0.9))) +
+  #scale_y_continuous("log(Lambda)", labels = paste0("log(", as.character(geneLambdas$Lambda), ")"), breaks = log(geneLambdas$Lambda)) +
+  facet_wrap( ~ Number_of_clusters) + 
+  labs(title = "How does the optimal regression parameter vary for different categories of genes?",
+       subtitle = "Log fold-change in highest expressed cluster compared to other clusters", x = "Max log fold-change") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
 ```
 
 ## Distribution of errors across genes
@@ -3574,7 +3562,7 @@ For each gene, we test the prediction accuracy of 21 values of $\lambda$ (rangin
 
 ```{r seurat11clustersIndividualGenesLambda, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
 #create seurat object
-#seurat <- createSeurat(scrna)
+seurat <- createSeurat(scrna)
 
 #list of resolutions for different numbers of seurat clusters
 clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
@@ -3652,15 +3640,11 @@ perGeneConstrainedRidgeRegression <- function(bulk, timeProportions, optimalLamb
   return(sc)
 }
 
-#select particular case to deconvolute
-clust <- "11"
-
 #read in all scores for all values of lambda and all genes
-#geneLambdas <- readRDS("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/geneLambdas.rds")
+geneLambdas <- readRDS("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/geneLambdas.rds")
 
 #subset table to optimal values for current clustering
 optimalLambdas <- geneLambdas %>% 
-  filter(Dataset == "Reconstructed pseudobulk") %>% 
   group_by(Gene) %>% 
   filter(Number_of_clusters == clust) %>% 
   filter(Relative_error == min(Relative_error)) %>% 
@@ -3681,7 +3665,7 @@ X <- scrna %>%
   summarise(value = mean(value)) %>% 
   dcast(gene ~ cluster) %>% 
   magrittr::set_rownames(.$gene) %>% 
-  select(-1) %>% 
+  dplyr::select(-1) %>% 
   as.matrix() %>% 
   t()
 
@@ -3714,11 +3698,23 @@ prediction <- prediction[,unlist(apply(prediction, 2, var)) > 0]
 #add cluster labels
 rownames(prediction) <- paste0("cluster_", 0:(length(unique(Idents(seurat)))-1))
 
+#rename clusters based on classification
+rownames(prediction) <- c(paste0(rownames(prediction)[1:3],"_M"), paste0(rownames(prediction)[4:7],"_E"),
+                          "cluster_7_M", "cluster_8_E", "cluster_9_M", "cluster_10_E")
+
+#reorder prediction to go E -> M
+prediction <- prediction[c(grep("E", rownames(prediction), value = TRUE), grep("M", rownames(prediction), value = TRUE)) , ]
+
 #hallmark genes to keep
 #read in EMT hallmark genes
 hallmark <- read.delim("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/hallmark_emt_geneset.txt", header = F)[,1]
 hallmarkOverlap <- intersect(overlapGenes, hallmark)
 prediction_hallmark <- prediction[,intersect(colnames(prediction), hallmarkOverlap)]
+
+#save locally
+#write.csv(t(prediction), "/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/sc_predictions_11_clusters.csv")
+#write.csv(t(prediction_hallmark), "/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/sc_hallmark_predictions_11_clusters.csv")
+
 
 #subset of known epithelial/mesenchymal markers
 E <- c("SDC1", "RHOB", "GPC1", "SDC4")
@@ -3727,4 +3723,371 @@ M <- c("VIM", "FN1", "PLOD1", "FLNA")
 #visualize
 pheatmap(t(prediction), scale = "row", show_rownames = F, cluster_cols = F, main = "Single-cell proteomics prediction - Seurat 11 clusters - all genes")
 pheatmap(t(prediction_hallmark), scale = "row", show_rownames = T, cluster_cols = F, main = "Single-cell proteomics prediction - Seurat 11 clusters - EMT hallmark genes", cluster_rows = T)
+```
+
+# Comparison to single-cell proteomics data
+
+As an external benchmark, the Nikolai Slavov group at Northeastern University shared with us an unpublished MS-derived single-cell proteomics dataset from cells undergoing EMT. Their experimental setup consists of three timepoints, and the data has 1,827 genes x 420 cells, out of which 1,064 genes, including 27 of the hallmark genes, were also detected in our own data. In this section, we compare those experimentally-derived single-cell profiles to our computationally-predicted ones as an external benchmark.
+
+## Data Pre-processing
+
+For all downstream analysis, only the set of ~1,000 genes that overlap between the single-cell proteomics, bulk proteomics, and scRNA-Seq datasets are retained. 65% of the original single-cell proteomics matrix consists of missing values which were imputed by k-nearest neighbor imputation (k = 3) using Euclidean distance as a similarity measure between the cells following the [Specht et al](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-021-02267-5#Sec16) publication.
+
+```{r imputationFunction}
+#imputation function (originally called hknn) modified from https://github.com/SlavovLab/SCoPE2/blob/master/code/functions_parameters.R
+sc_imputation<-function(dat, k, distanceMetric = c("euclidean", "pearson")){
+  
+  # Create a copy of the data, NA values to be filled in later
+  dat <- as.matrix(dat)
+  dat.imp <- dat
+  
+  # Calculate similarity metrics for all column pairs
+  if(distanceMetric == "euclidean"){
+    dist.mat <- as.matrix(dist(t(dat)))
+  }
+  if(distanceMetric == "pearson"){
+    dist.mat <- 1 - cor(dat, use = "pairwise.complete.obs")
+  }
+  
+  # Column names of the similarity matrix, same as data matrix
+  cnames <- colnames(dist.mat)
+  
+  # For each column (aka cell) in the data... 
+  for(X in cnames){
+    
+    # Find the distances of all other columns to that column 
+    distances <- dist.mat[, X]
+    
+    # Reorder the distances, smallest to largest (this will reorder the column names as well)
+    distances.ordered <- distances[order(distances, decreasing = F)]
+    
+    # Reorder the data matrix columns, smallest distance to largest from the column of interest
+    dat.reordered <- dat[ , names(distances.ordered) ]
+    
+    # Take the values in the column of interest
+    vec <- dat[, X]
+    
+    # Which entries are missing and need to be imputed...
+    na.index <- which( is.na(vec) )
+    
+    # For each of the missing entries (rows) in column X...
+    for(i in na.index){
+      # Find the most similar columns that have a non-NA value in this row
+      closest.columns <- names( which( !is.na(dat.reordered[i, ])  ) )
+      
+      # If there are more than k such columns, take the first k most similar
+      if( length(closest.columns)>k ){
+        # Replace NA in column X with the mean the same row in k of the most similar columns
+        vec[i]<-mean( dat[ i, closest.columns[1:k] ] )
+      }
+      
+      
+      # If there are less that or equal to k columns, take all the columns
+      if( length(closest.columns)<=k ){
+        # Replace NA in column X with the mean the same row in all of the most similar columns
+        vec[i]<-mean( dat[ i, closest.columns ] )
+      }
+    }
+    
+    # Populate a the matrix with the new, imputed values
+    dat.imp[,X] <- vec
+  }
+  return(dat.imp)
+}
+```
+
+
+```{r processSCproteomicsData}
+#read in single-cell proteomics data and summarize to protein level by taking median of each protein's peptides after filtering out control cells
+#scProt <- fread("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/Slavov sc proteomics/slavov_sc_proteomics_emt_filtered_cells.txt", drop = 1) %>% 
+# filter(control == "sc", celltype != "neg") %>% 
+# mutate(quantitation = ifelse(is.na(quantitation), 0, quantitation)) %>% 
+# group_by(protein, id) %>% 
+# summarise(quantitation = median(quantitation), id = paste(unique(id), unique(celltype), sep="_")) %>% 
+# dcast(protein ~ id, value.var = "quantitation")
+
+#data pre-processing function
+preprocessSCProteomics <- function(scProt, k = 3, distanceMetric = c("euclidean", "pearson")){
+  #impute missing values in matrix by KNN imputation
+  scProt <- sc_imputation(dat = scProt, k, distanceMetric)
+  
+  #read in cell timepoint labels
+  cellLabels <- unique(fread("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/Slavov sc proteomics/slavov_sc_proteomics_emt_filtered_cells.txt", drop = 1)[, c("id", "celltype")]) %>% 
+    filter(id %in% colnames(scProt))
+  
+  #create new cell labels combining cell ID and timepoint
+  cellLabels$key <- paste(cellLabels$id, cellLabels$celltype, sep = "_") 
+  
+  #order cells based on timepoint
+  cellLabels <- cellLabels[order(cellLabels$celltype),]
+  
+  #create vector with cell ID mapping
+  cellLabels <- setNames(cellLabels$key, cellLabels$id)
+  
+  #change column names of matrix to include cell labels
+  colnames(scProt) <- cellLabels[colnames(scProt)]
+  
+  #sort cells by timepoint
+  scProt <- scProt[, cellLabels]
+  
+  #read in UniProt mappings
+  uniprot <- fread("/Users/Ahmed/Documents/Emili_Lab/PPI Databases/UniProt ID mapping/uniprot_human_mapping.csv")
+  uniprot <- setNames(uniprot$gene_symbol, uniprot$uniprot)
+  
+  #map UniProt IDs to gene symbols
+  rownames(scProt) <- make.unique(gsub(pattern = "-.*", "", rownames(scProt)))
+  mappings <- uniprot[rownames(scProt)]
+  scProt <- scProt[!is.na(mappings),]
+  rownames(scProt) <- make.unique(mappings[!is.na(mappings)])
+  
+  #list of genes detected in each dataset
+  allProts <- list("scRNA-Seq" = rownames(scrna), "Bulk Proteomics" = rownames(proteome), "SC Proteomics" = rownames(scProt))
+  
+  #venn diagram showing overlap of detected proteins
+  #ggvenn::ggvenn(data = allProts, columns = c("scRNA-Seq", "Bulk Proteomics", "SC Proteomics"))
+  
+  #list of overlapping genes
+  overlapProts <- Reduce(intersect, allProts)
+  
+  #keep overlapping genes only
+  scProt <- scProt[overlapProts,]
+  
+  return(scProt)
+}
+
+#non-normalized protein values
+scProt <- read.delim("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/Slavov sc proteomics/slavov_sc_proteomics_emt_raw_protein.txt", row.names = 1)
+
+#pre-process data
+scProt <- preprocessSCProteomics(scProt, k = 3, distanceMetric = "euclidean")
+```
+
+The proteins detected only in the single-cell proteomics data showed significant enrichment ($FDR < 0.05$) of the following GO terms:
+
+```{r scOnlyProteinsEnrichment, message = FALSE}
+#find proteins exclusive to sc proteomics
+scOnlyProts <- allProts$`SC Proteomics`[!(allProts$`SC Proteomics` %in% allProts$`Bulk Proteomics`) & !(allProts$`SC Proteomics` %in% allProts$`scRNA-Seq`)]
+
+#pathway enrichment
+enrich <- enrichR::enrichr(genes = scOnlyProts, databases = c("GO_Biological_Process_2021", "GO_Cellular_Component_2021", "GO_Molecular_Function_2021")) %>% 
+  do.call("rbind", .) %>% 
+  filter(Adjusted.P.value < 0.05) %>% 
+  select(Term, Overlap, Genes)
+
+kable(enrich, caption = "SIgnificantly-enriched pathways among proteins detected exclusively by sc proteomics") %>%
+  kable_styling(latex_options = c("striped", "hold_position")) %>% 
+  row_spec(row = 0, bold = T, color = "white", background = "gray")
+```
+
+## Identify cell clusters across datasets
+
+First, the cell states in the single-cell proteomics dataset are identified in an unsupervised manner based on similarity of protein abundance profiles. All cells from all timepoints are pooled together for this analysis. [Seurat](https://www.nature.com/articles/nbt.4096) is used to cluster the cells based on the 2,000 most variable proteins following their standard pipeline for scRNA-Seq data. Our model defines 11 cell clusters, to be comparable to the clusters identified in the scRNA-Seq data, by using a Seurat clustering resolution of 2.5 in the proteomics data and 1.2 in the RNA data. The below UMAP plots visualize the identified cell clusters.
+
+```{r reconstructBulkProteomicsFromSCproteomics, fig.width = 10}
+#create seurat objects
+seuratProt <- createSeurat(as.matrix(scProt))
+seuratRNA <- createSeurat(as.matrix(scrna[overlapProts,]))
+
+#cluster both to 11 clusters
+seuratProt <- FindClusters(seuratProt, resolution = 2.5, random.seed = 123)
+seuratRNA <- FindClusters(seuratRNA, resolution = 1.2, random.seed = 123)
+
+#UMAP dimensionality reduction
+seuratProt <- RunUMAP(seuratProt, dims = 1:10)
+seuratRNA <- RunUMAP(seuratRNA, dims = 1:10)
+
+#plot UMAP
+p1 <- DimPlot(seuratProt, reduction = "umap", label = T, pt.size = 3) + ggtitle("SC Proteomics cell clusters")
+p2 <- DimPlot(seuratRNA, reduction = "umap", label = T, pt.size = 3) + ggtitle("scRNA cell clusters")
+p1 | p2
+
+#UMAP
+set.seed(123)
+umap <- as.data.frame(uwot::umap(t(scProt)))
+umap$timepoint <- colnames(seuratProt)
+umap$timepoint <- gsub(".*_","", umap$timepoint)
+
+#create matrix A with counts of cell clusters in each timepoint
+A_prot <- computeCellProportions(seuratProt)
+A_rna <- computeCellProportions(seuratRNA)
+
+#convert cell type counts to proportions
+timeProportions_prot <- data.frame(apply(A_prot, 1, function(x) return(x/sum(x))))
+
+#convert to long format for ggplot
+timeProportions_prot <- melt(timeProportions_prot)
+colnames(timeProportions_prot) <- c('Timepoint', 'Proportion')
+timeProportions_prot$Proportion <- round(timeProportions_prot$Proportion, 2)
+
+#add column for cluster name
+timeProportions_prot$Cell_Type <- as.factor(rep(0:(length(unique(Idents(seuratProt)))-1), length(unique(timeProportions_prot$Timepoint))))
+
+#plot
+p1 <- ggplot(timeProportions_prot, aes(x = Timepoint, y = Proportion, fill = Cell_Type,
+                                       label = ifelse(Proportion > 0.015, paste0(Proportion*100,'%'), "") )) +
+  geom_bar(stat = 'identity') + 
+  geom_text(size = 2, position = position_stack(vjust = 0.5)) +
+  ggtitle("Cell type composition in each timepoint - SC Proteomics")
+
+#convert cell type counts to proportions
+timeProportions_rna <- data.frame(apply(A_rna, 1, function(x) return(x/sum(x))))
+
+#convert to long format for ggplot
+timeProportions_rna <- melt(timeProportions_rna)
+colnames(timeProportions_rna) <- c('Timepoint', 'Proportion')
+timeProportions_rna$Proportion <- round(timeProportions_rna$Proportion, 2)
+
+#add column for cluster name
+timeProportions_rna$Cell_Type <- as.factor(rep(0:(length(unique(Idents(seuratProt)))-1), length(unique(timeProportions_rna$Timepoint))))
+
+#plot
+p2 <- ggplot(timeProportions_rna[timeProportions_rna$Timepoint %in% c("T0", "T4", "T8"),], aes(x = Timepoint, y = Proportion, fill = Cell_Type,
+                                                                                               label = ifelse(Proportion > 0.015, paste0(Proportion*100,'%'), "") )) +
+  geom_bar(stat = 'identity') + 
+  geom_text(size = 2, position = position_stack(vjust = 0.5)) +
+  ggtitle("Cell type composition in each timepoint - SC RNA")
+
+p1 | p2
+
+#merge UMAP plots
+scUMAP <- seuratProt@reductions$umap@cell.embeddings %>% as.data.frame() %>% mutate(cluster = paste0("proteomics_", Idents(seuratProt)),
+                                                                                    data ="SC proteomics", timepoint = gsub(".*_", "", colnames(scProt)))
+rnaUMAP <- seuratRNA@reductions$umap@cell.embeddings %>% as.data.frame() %>% mutate(cluster = paste0("rna_", Idents(seuratRNA)),
+                                                                                    data = "scRNA", timepoint = gsub(".*_", "", colnames(scrna)))
+mergedUMAP <- rbind(scUMAP, rnaUMAP)
+
+#plot merged UMAP
+ggplot(mergedUMAP, aes(x = UMAP_1, y = UMAP_2, color = cluster, shape = data)) +
+  geom_point(size = 2) +
+  labs(title = "Combined UMAP of SC Proteomics and scRNA cells")
+```
+
+## Cell cluster profiles
+
+For each cluster, a cell cluster profile is constructed as the average gene expression profile of the member cells. Consequently, the cell cluster profile matrix $X$ consists of the ~1,000 genes * 11 cell clusters. Cell clusters are labeled as epithelial ($E$), mesenchymal ($M$), or intermediate ($I$) based on manual inspection of the above timepoint proportion plots. The heatmap below shows the constructed cell cluster profiles scaled by row.
+
+```{r constructCellClusterProfiles}
+#construct matrix with cell-type expression of each gene
+X_prot <- as.data.frame(scProt[overlapProts,]) %>% 
+  mutate(gene = rownames(.)) %>% 
+  melt() %>% 
+  mutate(cluster = Idents(seuratProt)[variable]) %>% 
+  group_by(gene, cluster) %>% 
+  summarise(value = mean(value)) %>% 
+  dcast(gene ~ cluster) %>% 
+  magrittr::set_rownames(.$gene) %>% 
+  dplyr::select(-1) %>% 
+  as.matrix() #%>% 
+#t()
+
+#rename clusters based on classification
+colnames(X_prot) <- c("cluster_0_E", "cluster_1_M", "cluster_2_I", "cluster_3_E", "cluster_4_E", "cluster_5_M",
+                      "cluster_6_I", "cluster_7_M", "cluster_8_I", "cluster_9_E", "cluster_10_M")
+
+#reorder clusters to go E -> M
+X_prot <- X_prot[, c(grep("E", colnames(X_prot), value = TRUE), grep("I", colnames(X_prot), value = TRUE), grep("M", colnames(X_prot), value = TRUE))]
+
+#predicted profiles
+X_prediction <- t(prediction)
+
+#overlap
+predictionOverlap <- intersect(rownames(X_prot), rownames(X_prediction))
+X_prot <- X_prot[predictionOverlap,]
+X_prediction <- X_prediction[predictionOverlap,]
+
+#rename cluster centroids to indicate which dataset they came from
+colnames(X_prot) <- paste0("sc_", colnames(X_prot))
+colnames(X_prediction) <- paste0("prediction_", colnames(X_prediction))
+
+pheatmap(X_prot, scale = "row",
+         show_rownames = F, show_colnames = T,
+         cluster_cols = F, cluster_rows = F, 
+         main = "SC proteomics cell cluster profiles (scaled by row)")
+
+pheatmap(X_prediction, scale = "row",
+         show_rownames = F, show_colnames = T,
+         cluster_cols = F, cluster_rows = F, 
+         main = "Predicted proteomics cell cluster profiles (scaled by row)")
+```
+
+
+The below UMAP plot includes the centroid of each cluster in each dataset. The centroid is computed as the average abundance of each protein in each cluster's cells. Prior to performing the UMAP dimensionality reduction, the values were normalized to sum to 1 in each cluster.
+
+```{r UMAPcombinedCentroids}
+#merge centroids to one table
+mergedCentroids <- cbind(X_prot, X_prediction)
+
+#normalize cluster centroids to sum to 1 in each cluster
+mergedCentroids <- apply(mergedCentroids, 2, function(x) return(x / sum(x)))
+
+#UMAP
+set.seed(123)
+mergedCentroidsUmap <- as.data.frame(uwot::umap(t(mergedCentroids))) %>% mutate(cluster = colnames(mergedCentroids),
+                                                                                data = gsub("_.*", "", colnames(mergedCentroids)))
+
+ggplot(mergedCentroidsUmap, aes(x = V1, y = V2, color = cluster, shape = data)) +
+  geom_point(size = 2) +
+  labs(title = "Combined UMAP of SC Proteomics and scRNA cluster centroids") +
+  theme_bw()
+```
+
+## Re-constructing bulk proteomics data from single-cell proteomics data
+
+In this section, we examine the relationship between the bulk proteomics data generated by the Emili Lab and the single-cell proteomics data generated by the Slavov Lab, both of which are dependent on mass spectrometry. The bulk proteomics data was subset to the three timepoints corresponding to days 0, 3, and 9 to correspond with the single-cell proteomics data. The three replicates of each timepoint in the bulk data were averaged to produce one profile per timepoint.
+
+To compare the single-cell proteomics to the bulk, we create two datasets from the single-cell proteomics data:
+
+1) ***Pseudo-bulk***: A pseudo-bulk proteomics dataset is created for each timepoint by summing the protein levels of all cells within the timepoint.
+2) ***Reconstructed Pseudo-bulk***: The reconstructed pseudo-bulk is created by matrix multiplication of the average cell cluster abundance of each protein and the number of cells in each cluster in each timepoint, i.e. $Y = AX$.
+
+```{r reconstructBulkProteomicsFromScProteomics}
+#read in '2D' proteomics data and average replicates in each timepoint
+bulkProt <- fread("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/proteinGroups_Prot.txt") %>% 
+  as.data.frame() %>% 
+  .[, c("Gene names", grep("Reporter intensity corrected .* [A-C]", colnames(.), value = TRUE))] %>% 
+  magrittr::set_names(c("Gene", gsub("Reporter intensity corrected ", "T", colnames(.)[-1]))) %>% 
+  melt() %>% 
+  #average replicates
+  mutate(variable = gsub(" .*","", variable)) %>% 
+  group_by(Gene, variable) %>% 
+  summarize(intensity = mean(value)) %>% 
+  #convert to wide format
+  dcast(Gene ~ variable) %>% 
+  magrittr::set_rownames(.$Gene) %>% 
+  #keep timepoints that are present in sc proteomics data
+  select(c("T0", "T3", "T9")) %>%
+  as.matrix()
+
+#keep overlapping genes only
+bulkProt <- bulkProt[predictionOverlap,]
+
+#create pseudobulk proteomics
+pseudobulkProt <- createPseudoBulk(scProt)
+
+#create reconstructed pseudobulk proteomics
+reconstructedProt <- t(A_prot %*% t(X_prot))
+```
+
+## Comparing cell clusters across datasets
+
+The below plot visualizes the correlation of the cell cluster centroids predicted by our algorithm and those computed from the single-cell proteomics data.
+
+```{r comparingClusters}
+#correlate clusters
+columnCor <- lapply(seq(ncol(X_prot)), function(i){
+  curPrediction <- X_prediction[,i]
+  clusterCors <- list()
+  for(j in seq(ncol(X_prot))){
+    curProt <- X_prot[,j]
+    curCor <- cor(curPrediction, curProt)
+    clusterCors <- append(clusterCors, curCor)
+  }
+  return(unlist(clusterCors))
+}) %>% 
+  do.call("rbind", .)
+rownames(columnCor) <- colnames(X_prediction)
+colnames(columnCor) <- colnames(X_prot)
+pheatmap(columnCor, main = "Pearson correlation of cluster centroids")
+
+#columnCor <- unlist(lapply(columnCor, max))
 ```

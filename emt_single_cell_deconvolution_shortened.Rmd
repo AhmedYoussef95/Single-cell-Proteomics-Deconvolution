@@ -36,7 +36,7 @@ library(ggpubr) #correlation plots annotation
 
 # Introduction
 
-The fundamental unit of all living organisms is the cell, and recent technological advances have granted us unprecedented opportunities to study life at this principal level. Proteins, through their networks of interactions, carry out most of the vital biological processes governing cellular functions, yet remain largely unexplored in the single-cell space, representing crucial gaps in our knowledge of cell biology. While single-cell proteomics methods are still in their infancy, single-cell RNA sequencing (scRNA-Seq) has emerged in recent years as a powerful technology for defining cell states on a large scale, enabling breakthroughs in many areas of cell biology research, and begging the question of whether it can be used for making inferences at the protein level. **In this report, I explore the deconvolution of bulk proteomics data to the single-cell level using scRNA-Seq data.**
+The fundamental unit of all living organisms is the cell, and recent technological advances have granted us unprecedented opportunities to study life at this principal level. Proteins, through their networks of interactions, carry out most of the vital biological processes governing cellular functions, yet remain largely unexplored in the single-cell space, representing crucial gaps in our knowledge of cell biology. While single-cell proteomics methods are still in their infancy, single-cell RNA sequencing (scRNA-Seq) has emerged in recent years as a powerful technology for defining cell states on a large scale, enabling breakthroughs in many areas of cell biology research, and raising the question of whether it can be used for making inferences at the protein level. **In this report, we explore the deconvolution of bulk proteomics data to the single-cell level using scRNA-Seq data.**
 
 # Experiment summary
 
@@ -125,11 +125,6 @@ scrna <- scrna %>%
 
 #get number of cells in each timepoint
 cellsPerTimepoint <- table(gsub(".*_","", colnames(scrna)))
-
-#display table with no. of cells per timepoint
-kable(t(cellsPerTimepoint), caption = "Number of cells in each timepoint") %>%
-  kable_styling(latex_options = c("striped", "hold_position")) %>% 
-  row_spec(row = 0, bold = T, color = "white", background = "gray")
 ```
 
 # Data summary - Bulk mRNA
@@ -270,12 +265,12 @@ createSeurat <- function(counts){
 }
 
 #function to compute cell-type proportions 'A' given seurat-clustered data
-computeCellProportions <- function(seurat){
+computeCellProportions <- function(seuratObject){
   #construct matrix with number of cells from each type in each timepoint
-  A <- as.data.frame(seurat@assays$RNA@counts) %>% 
+  A <- as.data.frame(seuratObject@assays$RNA@counts) %>% 
     mutate(gene = rownames(.)) %>% 
     melt() %>% 
-    mutate(cluster = Idents(seurat)[variable], timepoint = gsub(".*_","", variable)) %>% 
+    mutate(cluster = Idents(seuratObject)[variable], timepoint = gsub(".*_","", variable)) %>% 
     group_by(cluster, timepoint) %>% 
     summarize(count = length(unique(variable))) %>% 
     tidyr::spread(key = cluster, value = count, fill = 0) %>% 
@@ -834,7 +829,7 @@ p1|p2|p3
 The below heatmaps visualize the real scRNA-defined cluster profiles with the predicted ones from deconvoluting the different RNA datasets described below.
 
 1) ***Pseudo-bulk***: A pseudo-bulk RNA dataset is created for each timepoint by summing the gene counts of all cells within the timepoint.
-2) ***Reconstructed Pseudo-bulk***: The reconstructed pseudo-bulk is created by matrix multiplication of the average cell cluster expression of each gene and the number of cells in each cluster each timepoint, i.e. $Y = AX$.
+2) ***Reconstructed Pseudo-bulk***: The reconstructed pseudo-bulk is created by matrix multiplication of the average cell cluster expression of each gene and the number of cells in each cluster in each timepoint, i.e. $Y = AX$.
 3) ***Bulk mRNA***: Bulk mRNA data from a microarray experiment.
 
 **The $\lambda$ values used for the regression were those deemed to be optimal based on the reconstructed pseudobulk dataset.** We furthermore focus on a set of 80 hallmark genes associated with EMT from the [MSigDB database](https://www.gsea-msigdb.org/gsea/msigdb/cards/HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION.html). 
@@ -917,10 +912,10 @@ ComplexHeatmap::Heatmap(t(allX),
                         show_row_names = F, show_column_names = F, 
                         row_title = "Genes")
 ```
-
+\newpage
 ###### EMT hallmark genes (scaled across clusters)
 
-```{r hallmarkHeatmapsPredictions, fig.width = 12}
+```{r hallmarkHeatmapsPredictions, fig.width = 16, fig.height = 12}
 #read in EMT hallmark genes
 hallmark <- read.delim("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/hallmark_emt_geneset.txt", header = F)[,1]
 
@@ -937,7 +932,7 @@ allX <- do.call("rbind", list(X, X_hat_Y, X_hat_Yhat, X_hat_bulk))
 ComplexHeatmap::Heatmap(t(allX),
                         name = "Counts", cluster_columns = FALSE, cluster_rows = TRUE,
                         column_split = rep(matrixNames, each = as.integer(clust)), use_raster = T, 
-                        show_row_names = F, show_column_names = F, 
+                        show_row_names = T, show_column_names = F, 
                         row_title = "Genes")
 
 ```
@@ -951,6 +946,9 @@ In this section of the report, we focus on deconvoluting the bulk proteomics dat
 ```{r seurat11clusters, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
 #create seurat object
 #seurat <- createSeurat(scrna)
+
+#list of resolutions for different numbers of seurat clusters
+clusters <- setNames(c(0.2,0.3,0.4,0.5,0.7,0.9,1.0,1.32,1.35,1.4,1.8), 5:15)
 
 #determine number of seurat clusters
 clust <- "11"
@@ -1024,11 +1022,10 @@ perGeneConstrainedRidgeRegression <- function(bulk, timeProportions, optimalLamb
 }
 
 #read in all scores for all values of lambda and all genes
-#geneLambdas <- readRDS("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/geneLambdas.rds")
+geneLambdas <- readRDS("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/geneLambdas.rds")
 
 #subset table to optimal values for current clustering
 optimalLambdas <- geneLambdas %>% 
-  filter(Dataset == "Reconstructed pseudobulk") %>% 
   group_by(Gene) %>% 
   filter(Number_of_clusters == clust) %>% 
   filter(Relative_error == min(Relative_error)) %>% 
@@ -1049,7 +1046,7 @@ X <- scrna %>%
   summarise(value = mean(value)) %>% 
   dcast(gene ~ cluster) %>% 
   magrittr::set_rownames(.$gene) %>% 
-  select(-1) %>% 
+  dplyr::select(-1) %>% 
   as.matrix() %>% 
   t()
 
@@ -1082,11 +1079,23 @@ prediction <- prediction[,unlist(apply(prediction, 2, var)) > 0]
 #add cluster labels
 rownames(prediction) <- paste0("cluster_", 0:(length(unique(Idents(seurat)))-1))
 
+#rename clusters based on classification
+rownames(prediction) <- c(paste0(rownames(prediction)[1:3],"_M"), paste0(rownames(prediction)[4:7],"_E"),
+                          "cluster_7_M", "cluster_8_E", "cluster_9_M", "cluster_10_E")
+
+#reorder prediction to go E -> M
+prediction <- prediction[c(grep("E", rownames(prediction), value = TRUE), grep("M", rownames(prediction), value = TRUE)) , ]
+
 #hallmark genes to keep
 #read in EMT hallmark genes
 hallmark <- read.delim("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/hallmark_emt_geneset.txt", header = F)[,1]
 hallmarkOverlap <- intersect(overlapGenes, hallmark)
 prediction_hallmark <- prediction[,intersect(colnames(prediction), hallmarkOverlap)]
+
+#save locally
+#write.csv(t(prediction), "/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/sc_predictions_11_clusters.csv")
+#write.csv(t(prediction_hallmark), "/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/sc_hallmark_predictions_11_clusters.csv")
+
 
 #subset of known epithelial/mesenchymal markers
 E <- c("SDC1", "RHOB", "GPC1", "SDC4")
@@ -1179,21 +1188,22 @@ bulk_proteomics <- bulk_proteomics[,overlapGenes]
 bulk_proteomics <- bulk_proteomics / (sum(bulk_proteomics) / sum(Y))
 
 #predict single-cell profiles using constrained ridge regression
-prediction <- perGeneConstrainedRidgeRegression(bulk = bulk_proteomics, timeProportions = A, optimalLambdas = optimalLambdas)
+prediction <- t(perGeneConstrainedRidgeRegression(bulk = bulk_proteomics, timeProportions = A, optimalLambdas = optimalLambdas))
 
 #remove zero variance genes
-prediction <- prediction[,unlist(apply(prediction, 2, var)) > 0]
+prediction <- prediction[unlist(apply(prediction, 2, var)) > 0,]
 
 #add cluster labels
-rownames(prediction) <- paste0("cluster_", 1:(length(unique(Idents(seurat)))))
+colnames(prediction) <- paste0("cluster_", 1:(length(unique(Idents(seurat)))))
 
 #hallmark genes to keep
 #read in EMT hallmark genes
 hallmark <- read.delim("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/hallmark_emt_geneset.txt", header = F)[,1]
 hallmarkOverlap <- intersect(overlapGenes, hallmark)
-prediction_hallmark <- prediction[,intersect(colnames(prediction), hallmarkOverlap)]
+prediction_hallmark <- prediction[intersect(rownames(prediction), hallmarkOverlap),]
 
 #visualize
-pheatmap(t(prediction), scale = "row", show_rownames = F, cluster_cols = F, main = "Single-cell proteomics prediction - Monocle 20 clusters - all genes")
-pheatmap(t(prediction_hallmark), scale = "row", show_rownames = T, cluster_cols = F, main = "Single-cell proteomics prediction - Monocle 20 clusters - EMT hallmark genes", cluster_rows = T)
+pheatmap(prediction, scale = "row", show_rownames = F, cluster_cols = F, main = "Single-cell proteomics prediction - Monocle 20 clusters - all genes")
+pheatmap(prediction_hallmark, scale = "row", show_rownames = T, cluster_cols = F, main = "Single-cell proteomics prediction - Monocle 20 clusters - EMT hallmark genes", cluster_rows = T)
 ```
+
