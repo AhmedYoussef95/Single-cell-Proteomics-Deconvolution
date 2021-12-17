@@ -38,7 +38,7 @@ library(enrichR) #pathway enrichment analysis
 
 # Introduction
 
-The fundamental unit of all living organisms is the cell, and recent technological advances have granted us unprecedented opportunities to study life at this principal level. Proteins, through their networks of interactions, carry out most of the vital biological processes governing cellular functions, yet remain largely unexplored in the single-cell space, representing crucial gaps in our knowledge of cell biology. While single-cell proteomics methods are still in their infancy, single-cell RNA sequencing (scRNA-Seq) has emerged in recent years as a powerful technology for defining cell states on a large scale, enabling breakthroughs in many areas of cell biology research, and begging the question of whether it can be used for making inferences at the protein level. **In this report, I explore the deconvolution of bulk proteomics data to the single-cell level using scRNA-Seq data.**
+	Biological research has become increasingly defined by the generation of large-scale datasets in need of specialized computational analysis to unravel the complexities underlying living systems. The fundamental unit of all living organisms is the cell, and recent technological advances have granted us unprecedented opportunities to study life at this principal level. Proteins, through their networks of interactions, carry out most of the vital biological processes governing cellular functions, yet remain largely unexplored at the  resolution of single cells, representing crucial gaps in our knowledge of cell biology. The current pandemic has exposed our need for a better understanding of the contextual nature of cellular functions in order to develop effective targeted therapies. While there remain challenging technical hurdles to overcome for experimentally measuring proteins on a systems-wide scale at the level of individual cells, single-cell RNA sequencing (scRNA-Seq) has emerged in recent years as a powerful technology for defining cell states on a large scale, enabling breakthroughs in many areas of cell biology research, and raising the question of whether this type of data can be used for making inferences at the protein level. **In this report, I explore the deconvolution of bulk proteomics data to the single-cell level using scRNA-Seq data.**
 
 # Experiment summary
 
@@ -4038,7 +4038,9 @@ In this section, we examine the relationship between the bulk proteomics data ge
 To compare the single-cell proteomics to the bulk, we create two datasets from the single-cell proteomics data:
 
 1) ***Pseudo-bulk***: A pseudo-bulk proteomics dataset is created for each timepoint by summing the protein levels of all cells within the timepoint.
-2) ***Reconstructed Pseudo-bulk***: The reconstructed pseudo-bulk is created by matrix multiplication of the average cell cluster abundance of each protein and the number of cells in each cluster in each timepoint, i.e. $Y = AX$.
+2) ***Reconstructed Pseudo-bulk***: The reconstructed pseudo-bulk is created by matrix multiplication of the average cell cluster abundance of each protein by the number of cells in each cluster in each timepoint, i.e. $Y = AX$.
+
+This gives three bulk proteomics datasets in total, including the actual bulk and the two datasets above. The three bulk datasets are shown below, with the genes maintained in the same order.
 
 ```{r reconstructBulkProteomicsFromScProteomics}
 #read in '2D' proteomics data and average replicates in each timepoint
@@ -4058,14 +4060,33 @@ bulkProt <- fread("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/p
   select(c("T0", "T3", "T9")) %>%
   as.matrix()
 
-#keep overlapping genes only
-bulkProt <- bulkProt[predictionOverlap,]
 
 #create pseudobulk proteomics
 pseudobulkProt <- createPseudoBulk(scProt)
 
 #create reconstructed pseudobulk proteomics
 reconstructedProt <- t(A_prot %*% t(X_prot))
+
+#keep overlapping genes only
+bulkProt <- bulkProt[predictionOverlap,]
+pseudobulkProt <- pseudobulkProt[predictionOverlap,]
+reconstructedProt <- reconstructedProt[predictionOverlap,]
+
+#put into one table
+allBulk <- as.matrix(do.call("cbind", list(bulkProt, pseudobulkProt, reconstructedProt)))
+
+#normalize cluster centroids to sum to 1 in each cluster
+allBulk <- apply(allBulk, 2, function(x) return(x / sum(x)))
+
+#names of matrices
+matrixNames <- c("Bulk proteomics", "Pseudobulk", "Reconstructed pseudobulk")
+
+#create heatmaps
+ComplexHeatmap::Heatmap(allBulk,
+                        name = "Counts", cluster_columns = FALSE, cluster_rows = T,
+                        column_split = rep(matrixNames, each = ncol(bulkProt)), use_raster = T, 
+                        show_row_names = F, show_column_names = T, 
+                        row_title = "Proteins")
 ```
 
 ## Comparing cell clusters across datasets

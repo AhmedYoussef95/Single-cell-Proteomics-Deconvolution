@@ -36,15 +36,15 @@ library(ggpubr) #correlation plots annotation
 
 # Introduction
 
-The fundamental unit of all living organisms is the cell, and recent technological advances have granted us unprecedented opportunities to study life at this principal level. Proteins, through their networks of interactions, carry out most of the vital biological processes governing cellular functions, yet remain largely unexplored in the single-cell space, representing crucial gaps in our knowledge of cell biology. While single-cell proteomics methods are still in their infancy, single-cell RNA sequencing (scRNA-Seq) has emerged in recent years as a powerful technology for defining cell states on a large scale, enabling breakthroughs in many areas of cell biology research, and raising the question of whether it can be used for making inferences at the protein level. **In this report, we explore the deconvolution of bulk proteomics data to the single-cell level using scRNA-Seq data.**
+Biological research has become increasingly defined by the generation of large-scale datasets in need of specialized computational analysis to unravel the complexities underlying living systems. The fundamental unit of all living organisms is the cell, and recent technological advances have granted us unprecedented opportunities to study life at this principal level. Proteins, through their networks of interactions, carry out most of the vital biological processes governing cellular functions, yet remain largely unexplored at the  resolution of single cells, representing crucial gaps in our knowledge of cell biology. The current pandemic has exposed our need for a better understanding of the contextual nature of cellular functions in order to develop effective targeted therapies. While there remain challenging technical hurdles to overcome for experimentally measuring proteins on a systems-wide scale at the level of individual cells, single-cell RNA sequencing (scRNA-Seq) has emerged in recent years as a powerful technology for defining cell states on a large scale, enabling breakthroughs in many areas of cell biology research, and raising the question of whether this type of data can be used for making inferences at the protein level. **In this report, we explore the deconvolution of bulk proteomics data to the single-cell level using scRNA-Seq data.**
 
 # Experiment summary
 
 Epithelial-to-mesenchymal transition (EMT) is a biological process in which epithelial cells gradually lose their adhesion and transition into mesenchymal cells. As one of the hallmarks of cancer progression, it is one of the long-standing interests of the biomedical research community. Towards profiling this process, protein and RNA samples were extracted from cells at 8 different timepoints during EMT and multiple layers of omics data were generated. These omics layers include proteomics, transcriptomics, phosphoproteomics, secretome, exosome among others. A pre-print with more details on the experiment and generated data can be found on bioRxiv [here (Paul et al, 2021)](https://www.biorxiv.org/node/2018285.external-links.html). This report is interested in the scRNA-Seq, microarray, and proteomics datasets generated in this study.
 
-# Approach
+# Rationale
 
-Bulk proteomics data gives a view of the aggregated protein abundance from all cell types within a sequenced sample. Using single-cell data, derived from the same samples, we can investigate the sample heterogeneity by estimating proportions of cell types within the bulk sample. We cannot reliably use these proportions to directly estimate the contribution of each population to each gene/protein's expression at the bulk-level however, since there is low correlation between RNA and protein levels of the same genes due to multiple biological factors, such as alternative splicing and post-translational modifications. Leveraging the timepoints present in this dataset, which conveniently show shifts in cell type abundances across time, we can instead look for changes in cell-type proportions and corresponding changes in bulk-level protein abundance as suggestive of relationships between specific cell types and specific proteins. This information can then potentially be used to estimate the contribution of individual cell types to the bulk proteomics measurements.
+A regression-based approach to this problem is suggested here which is primarily concerned with the lack of strong correlation between a gene’s RNA and protein levels, which is the main challenge with analyses aiming to integrate these two data modalities. Multiple biological and technical factors, such as alternative splicing and post-translational modifications, drive the weak correlation between the RNA and protein levels of the same set of genes, thus preventing us from using the gene expression values derived from scRNA-Seq to make inferences on the corresponding protein levels. Our approach aims to bridge this gap by utilizing the ability of scRNA-Seq to delineate functionally-distinct cell populations from heterogeneous mixtures, allowing us to distinguish the identity and proportions of the different cells populations making up the bulk sample for which we have the proteomics data measurements, as well as how these proportions change under different experimental contexts such as health and disease. We cannot reliably use these proportions to directly estimate the contribution of each population to each protein’s abundance at the bulk-level, however, due to variations in the relative abundance of each protein across the different cell populations. Leveraging the shifts in the bulk sample composition, as quantified by scRNA-Seq, we can instead use a regression model to combine the changes in cell population proportions with the corresponding fluctuations in bulk-level protein abundance as suggestive of relationships between specific cell populations and bulk protein levels. This information can then be used to estimate the protein levels within each cell population. Essentially, this approach aims to leverage scRNA data to break down bulk proteome measurements into cell population-level proteomes. 
 
 # Data summary - Proteomics
 
@@ -189,7 +189,7 @@ Prior to making inferences from the proteomics data, we first investigate the ab
 ![Schematic of single-cell deconvolution model](/Users/Ahmed/Documents/Emili_Lab/Aim%203/EMT%20Multi-omics/Plots/bulk%20decnovolution%20outline.png) 
 The five main steps underlying our approach are outlined below:
 
-1) ***Clustering***:  The cell states in our dataset are identified in an unsupervised manner based on similarity of gene expression profiles. All cells from all timepoints are pooled together for this analysis. For data pre-processing, we remove the genes with low expression counts, retaining genes with a minimum of 3 counts in at least 3 cells. This removed 1,240 genes (13% of all genes). On average, each cell expressed ~3,600 genes after processing. [Seurat](https://www.nature.com/articles/nbt.4096) is then used to cluster the cells with their default workflow based on the 2,000 most variable genes. We tested our approach on different pre-defined numbers of clusters in our analysis.
+1) ***Clustering***:  The cell states in our dataset are identified in an unsupervised manner based on similarity of gene expression profiles. All cells from all timepoints are pooled together for this analysis. For data pre-processing, we remove the genes with low expression counts, retaining genes with a minimum of 3 counts in at least 3 cells. This removed 1,240 genes (13% of all genes). On average, each cell expressed ~3,600 genes after processing. [Seurat](https://www.nature.com/articles/nbt.4096) is then used to cluster the cells with their default workflow based on the 2,000 most variable genes. We tested our approach on different pre-defined numbers of clusters in our analysis to examine the effect of varying the number of cell populations.
 
 2) ***Construct cell type proportions matrix A***: The timepoint \* cluster mixing matrix $A$ is constructed by counting the numbers of cell from each cluster in each timepoint.
 
@@ -486,13 +486,13 @@ geneLambdas <- readRDS("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/D
 
 #subset to optimal lambdas
 optimalLambdas <- geneLambdas %>% 
-  group_by(Gene, Number_of_clusters, Dataset) %>% 
+  group_by(Gene, Number_of_clusters) %>% 
   filter(Relative_error == min(Relative_error)) %>% 
   filter(!is.infinite(Relative_error))
 
 #average errors for each number of clusters
 errors <- optimalLambdas %>%
-  filter(Dataset == "Reconstructed pseudobulk") %>% 
+  #filter(Dataset == "Reconstructed pseudobulk") %>% 
   group_by(Number_of_clusters) %>% 
   summarise(Relative_error = mean(Relative_error))
 
@@ -525,7 +525,7 @@ seurat <- createSeurat(scrna)
 #for each no. of clusters, get each gene's error, specificity, and average expression (~30s)
 predictions <- pblapply(names(clusters), function(clust){
   #get error values for current no. of clusters
-  curErrors <- optimalLambdas[optimalLambdas$Number_of_clusters == as.numeric(clust) & optimalLambdas$Dataset == "Reconstructed pseudobulk",]
+  curErrors <- optimalLambdas[optimalLambdas$Number_of_clusters == as.numeric(clust),]
   
   #cluster seurat object
   seurat <- FindClusters(seurat, resolution = clusters[clust], random.seed = 123)
@@ -611,7 +611,7 @@ The cluster centroid is each cluster’s average gene expression profile. Visual
 #for each no. of clusters, construct UMAP
 umapList <- pblapply(names(clusters), function(clust){
   #get error values for current no. of clusters
-  curErrors <- optimalLambdas[optimalLambdas$Number_of_clusters == as.numeric(clust) & optimalLambdas$Dataset == "Reconstructed pseudobulk",]
+  curErrors <- optimalLambdas[optimalLambdas$Number_of_clusters == as.numeric(clust),]
   
   #cluster seurat object
   seurat <- FindClusters(seurat, resolution = clusters[clust], random.seed = 123)
@@ -694,7 +694,7 @@ More specifically, for a given number of clusters, we cluster the data using *Se
 #for each no. of clusters, predict X' and find average distance between cells and their centroids (~1m)
 centroidDistances <- pblapply(names(clusters), function(clust){
   #get error values for current no. of clusters
-  curErrors <- optimalLambdas[optimalLambdas$Number_of_clusters == as.numeric(clust) & optimalLambdas$Dataset == "Reconstructed pseudobulk",]
+  curErrors <- optimalLambdas[optimalLambdas$Number_of_clusters == as.numeric(clust),]
   
   #cluster seurat object
   seurat <- FindClusters(seurat, resolution = clusters[clust], random.seed = 123)
@@ -876,7 +876,7 @@ bulk <- t(mrna)
 
 #subset table to optimal values for current clustering
 optimalLambdas <- geneLambdas %>% 
-  filter(Dataset == "Reconstructed pseudobulk") %>% 
+  #filter(Dataset == "Reconstructed pseudobulk") %>% 
   group_by(Gene) %>% 
   filter(Number_of_clusters == clust) %>% 
   filter(Relative_error == min(Relative_error)) %>% 
@@ -983,6 +983,7 @@ ggplot(timeProportions, aes(x = Timepoint, y = Proportion, fill = Cell_Type,
   geom_text(size = 2, position = position_stack(vjust = 0.5)) +
   ggtitle("Cell type composition in each timepoint")
 ```
+#### Predicted cell cluster profiles
 
 ```{r deconvoluteProteomicsIndividualGeneLambdas, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold', fig.height = 12}
 #constrained ridge regression with gene-level lambdas
@@ -1104,106 +1105,5 @@ M <- c("VIM", "FN1", "PLOD1", "FLNA")
 #visualize
 pheatmap(t(prediction), scale = "row", show_rownames = F, cluster_cols = F, main = "Single-cell proteomics prediction - Seurat 11 clusters - all genes")
 pheatmap(t(prediction_hallmark), scale = "row", show_rownames = T, cluster_cols = F, main = "Single-cell proteomics prediction - Seurat 11 clusters - EMT hallmark genes", cluster_rows = T)
-```
-
-\newpage
-### Alternative clustering
-
-Here, we examine an alternative clustering of the data, which clustered the scRNA data into 20 clusters using the [Monocle3 algorithm](https://cole-trapnell-lab.github.io/monocle3/). Note: the regression parameters $\lambda$ chosen was the same one used for the Seurat clustering in the previous section.
-
-```{r monocleClustersIndividualLambdas, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold', fig.height = 8, fig.width = 12}
-#read in monocle clustering labels
-monocle <- read.delim("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/scRNAseq - 22 monocle clusters.txt")
-monocle <- setNames(monocle$clusters.HSMM., monocle$cells)
-Idents(seurat) <- monocle
-
-#plot UMAP
-DimPlot(seurat, reduction = "umap", label = T) + ggtitle("Monocle-identified cell clusters")
-
-#construct matrix with number of cells from each type in each timepoint
-A <- as.data.frame(seurat@assays$RNA@counts) %>% 
-  mutate(gene = rownames(.)) %>% 
-  melt() %>% 
-  mutate(cluster = monocle[variable], timepoint = gsub(".*_","", variable)) %>% 
-  group_by(cluster, timepoint) %>% 
-  summarize(count = length(unique(variable))) %>% 
-  tidyr::spread(key = cluster, value = count, fill = 0) %>% 
-  tibble::column_to_rownames("timepoint")
-
-#convert to matrix format
-A <- as.matrix(A)
-
-#convert cell type counts to proportions
-timeProportions <- data.frame(apply(A, 1, function(x) return(x/sum(x))))
-
-#convert to long format for ggplot
-timeProportions <- melt(timeProportions)
-colnames(timeProportions) <- c('Timepoint', 'Proportion')
-timeProportions$Proportion <- round(timeProportions$Proportion, 2)
-
-#add column for cluster name
-timeProportions$Cell_Type <- as.factor(rep(1:(length(unique(monocle))), ncol(mrna)))
-
-#plot
-ggplot(timeProportions, aes(x = Timepoint, y = Proportion, fill = Cell_Type,
-                            label = ifelse(Proportion > 0.015, paste0(Proportion*100,'%'), "") )) +
-  geom_bar(stat = 'identity') + 
-  geom_text(size = 2, position = position_stack(vjust = 0.5)) +
-  ggtitle("Cell type composition in each timepoint - Monocle clustering")
-```
-
-\newpage
-```{r deconvoluteProteomicsMonocleIndividualLambdas, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold', fig.height = 12}
-#construct matrix with cell-type expression of each gene
-X <- scrna %>% 
-  mutate(gene = rownames(.)) %>% 
-  melt() %>% 
-  mutate(cluster = Idents(seurat)[variable]) %>% 
-  group_by(gene, cluster) %>% 
-  summarise(value = mean(value)) %>% 
-  dcast(gene ~ cluster) %>% 
-  magrittr::set_rownames(.$gene) %>% 
-  select(-1) %>% 
-  as.matrix() %>% 
-  t()
-
-#bulk proteomics matrix
-bulk_proteomics <- t(proteome)
-
-#reconstruct pseudo-bulk matrix
-Y <- A %*% X
-
-#list of genes detected in each dataset
-allGenes <- list("scRNA-Seq" = rownames(scrna), "Proteomics" = rownames(proteome), "Bulk mRNA" = rownames(mrna))
-
-#list of overlapping genes
-overlapGenes <- Reduce(intersect, allGenes)
-
-#retain overlapping genes only in the datasets
-X <- X[,overlapGenes]
-Y <- Y[,overlapGenes]
-bulk_proteomics <- bulk_proteomics[,overlapGenes]
-
-#re-scale proteomics data to be comparable to RNA
-bulk_proteomics <- bulk_proteomics / (sum(bulk_proteomics) / sum(Y))
-
-#predict single-cell profiles using constrained ridge regression
-prediction <- t(perGeneConstrainedRidgeRegression(bulk = bulk_proteomics, timeProportions = A, optimalLambdas = optimalLambdas))
-
-#remove zero variance genes
-prediction <- prediction[unlist(apply(prediction, 2, var)) > 0,]
-
-#add cluster labels
-colnames(prediction) <- paste0("cluster_", 1:(length(unique(Idents(seurat)))))
-
-#hallmark genes to keep
-#read in EMT hallmark genes
-hallmark <- read.delim("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/hallmark_emt_geneset.txt", header = F)[,1]
-hallmarkOverlap <- intersect(overlapGenes, hallmark)
-prediction_hallmark <- prediction[intersect(rownames(prediction), hallmarkOverlap),]
-
-#visualize
-pheatmap(prediction, scale = "row", show_rownames = F, cluster_cols = F, main = "Single-cell proteomics prediction - Monocle 20 clusters - all genes")
-pheatmap(prediction_hallmark, scale = "row", show_rownames = T, cluster_cols = F, main = "Single-cell proteomics prediction - Monocle 20 clusters - EMT hallmark genes", cluster_rows = T)
 ```
 
