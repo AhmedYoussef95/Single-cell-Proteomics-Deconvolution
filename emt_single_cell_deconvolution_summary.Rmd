@@ -1,0 +1,1198 @@
+---
+title: "Deconvolution of proteomics data using scRNA-Seq"
+subtitle: "Multi-omics tracking of cells undergoing EMT"
+author: "Ahmed Youssef"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: pdf_document
+urlcolor: blue
+toc: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	message = FALSE,
+	warning = FALSE
+)
+#required packages
+library(data.table) #reading in large files quickly
+library(kableExtra) #for tables
+library(dplyr) #data wrangling
+library(magrittr) #data wrangling
+library(reshape2) #data wrangling
+library(purrr) #data wrangling
+library(tidyr) #data wrangling
+library(tibble) #data wrangling
+library(ggplot2) #plots
+library(patchwork) #plot figures plots on same plot
+library(ComplexHeatmap) #heatmaps
+library(celda) #scRNA clustering
+library(Seurat) #scRNA clustering
+library(ggvenn) #venn diagram
+library(uwot) #UMAP
+library(pracma) #distance between matrices
+library(Matrix) #matrix operations
+library(quadprog) #solving constrained OLS problem
+library(glmnet) #ridge regression
+library(pbapply) # parallel operations
+library(ggpubr) #correlation plots annotation
+library(enrichR) #pathway enrichment analysis
+```
+
+# Introduction
+
+The fundamental unit of all living organisms is the cell, and recent technological advances have granted us unprecedented opportunities to study life at this principal level. Proteins perform the majority of vital biological processes governing cellular functions, yet the proteome remains largely unexplored at the resolution of single cells, representing crucial gaps in our understanding of cellular complexity. Here, we present a novel deconvolution algorithm that combines single-cell RNA-sequencing (scRNA-Seq) with bulk proteomics to model the global proteome at the single-cell level. Our approach leverages cell profile similarities to overcome the weak correlation between RNA-Seq and proteomics that confounds existing deconvolution strategies. We apply our algorithm to cell differentiation datasets and demonstrate its ability to accurately reconstruct single-cell profiles from bulk-level measurements at both the proteome and transcriptome levels. Furthermore, we show that our algorithm is able to successfully cross the protein-RNA divide by using scRNA-Seq in combination with bulk proteomics to distinguish established canonical markers. Our method provides a generalizable computational framework for charting the relationship between bulk and single-cell molecular layers, and offers researchers the ability to study the proteome at the single-cell level using established bulk-proteomics workflows. This work also lays the foundation for transferring cell-state information between RNA and protein modalities, integrating the under-served layer of proteomics into the single-cell analysis toolkit to enhance the prioritization of cell populations for targeted therapeutics. 
+
+# Case Study - EMT Multi-Omics Experiment
+
+Epithelial-to-mesenchymal transition (EMT) is a biological process in which epithelial cells gradually lose their adhesion and transition into mesenchymal cells. As one of the hallmarks of cancer progression, it is one of the long-standing interests of the biomedical research community. Towards profiling this process, protein and RNA samples were extracted from cells at 8 different timepoints during EMT and multiple layers of omics data were generated. These omics layers include proteomics, transcriptomics, phosphoproteomics, secretome, exosome among others. A pre-print with more details on the experiment and generated data can be found on bioRxiv [here (Paul et al, 2021)](https://www.biorxiv.org/node/2018285.external-links.html). This report is interested in the scRNA-Seq and proteomics datasets generated in this study.
+
+# Rationale
+
+Bulk proteomics data gives a view of the aggregated protein abundance from all cell types within a sequenced sample. Using single-cell data, derived from the same samples, we can investigate the sample heterogeneity by estimating proportions of cell types within the bulk sample. We cannot reliably use these proportions to directly estimate the contribution of each population to each gene/protein's expression at the bulk-level however, since there is low correlation between RNA and protein levels of the same genes due to multiple biological and technical factors, such as alternative splicing and post-translational modifications. Leveraging the timepoints present in this dataset, which conveniently show shifts in cell state proportions across time, we can instead combine changes in cell state proportions with the corresponding changes in bulk-level protein abundance as suggestive of relationships between specific cell states and protein levels. This information can then be used to estimate the contribution of individual cell states to the bulk proteomics measurements.
+
+![Simplified schematic of single-cell deconvolution model](/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Figures/SC Deconvolution Summary.pdf) 
+
+# Methods
+
+
+\subsection*{Background}
+
+In our problem, we have $AX = Y$, where
+\begin{itemize}
+\item $A$ is timepoints $\times$ clusters
+\item $X$ is cluster centroids, meaning clusters $\times$ genes
+\item $Y$ are bulk timepoint data, meaning timepoints $\times$ genes
+\end{itemize}
+
+We seek to deconvolve $Y$ to find $X$:
+
+\[
+\hat{X} = \min_X \Vert AX - Y \Vert^2_F
+\]
+
+In general we expect to have less timepoints than clusters.  Hence this
+problem is highly underdetermined, and we need additional information to
+guide us to a good solution.
+
+\subsection*{Strategy}
+
+Our problem involves matrices $AX = Y$, but now let's use work one gene at a time (one column of $X$ and the corresponding column of $Y$).
+
+\subsubsection*{Nonnegativity}
+
+The first constraint we add is nonnegativity.
+This leads to the nonnegative least squares problem:
+
+\[ \hat{\mathbf{x}} =  \arg\min_{\mathbf{x}\geq 0} \Vert A\mathbf{x} - \mathbf{y} \Vert^2. \]
+
+Algebraically this is the same as solving the quadratic program:
+
+\[ \hat{\mathbf{x}} =  \arg\min_{\mathbf{x}\geq 0} -2\mathbf{y}^TA\mathbf{x} + \mathbf{x}^TA^TA\mathbf{x}. \]
+
+\subsubsection*{$\ell_2$ Regularization}
+
+The next constraint we add is $\ell_2$ regularization (ridge
+regression):
+
+\[ \hat{\mathbf{x}} =  \arg\min_{\mathbf{x}\geq 0} \Vert A\mathbf{x} - \mathbf{y} \Vert^2 + \lambda_\mathbf{x} \Vert \mathbf{x}\Vert^2 \]
+
+We use the notation $\lambda_\mathbf{x}$ to indicate that the proper amount of
+regularization depends on the properties of $\mathbf{x}$ (which we will exploit).
+
+This is equivalent to the quadratic program:
+
+\begin{eqnarray*}
+\hat{\mathbf{x}} & = & \arg\min_{\mathbf{x}\geq 0} -2\mathbf{y}^TA\mathbf{x} + \mathbf{x}^TA^TA\mathbf{x} + \lambda_\mathbf{x} \mathbf{x}^T\mathbf{x}\\
+& = & \arg\min_{\mathbf{x}\geq 0} -2\mathbf{y}^TA\mathbf{x} + \mathbf{x}^T(A^TA + \lambda_\mathbf{x} I)\mathbf{x}
+\end{eqnarray*}
+
+\subsubsection*{Similarity Regularization}
+
+Next we make the following observation: the process used to 
+construct $A$ may have access to additional information.   For example,
+if we use scRNA clusters to define the cell types leading to the
+cluster mixtures in $A$, we can make use of the cluster RNA expression
+profiles.
+
+We can use any similarity or dissimilarity matrix.  For concreteness,
+assume we have matrix $C$ which consists of cluster 
+centroids; ie, it has clusters on the rows and genes on the columns, and
+entries in $C$ correspond to average gene expression in the cluster.
+(Note that if the original scRNA data has missing values, this must be
+considered in forming cluster centroids).
+
+Perform standard normalization on the rows of $C$, so that rows have
+zero mean and unit norm, to obtain $\tilde{C}$.  Then form the correlation matrix of clusters,
+
+\[
+M = \tilde{C}\tilde{C}^T
+\]
+
+Now for a given gene $\mathbf{x}$, we seek to minimize $\mathbf{x}^TM^{-1}\mathbf{x}$.   This will
+tend to make entries in $\mathbf{x}$ close if the corresponding clusters have
+high similarity.
+
+So to include cluster similarity as a form of regularization, we
+minimize:
+
+
+\[ \hat{\mathbf{x}} =  \arg\min_{\mathbf{x}\geq 0} \Vert A\mathbf{x} - \mathbf{y} \Vert^2 + \lambda_\mathbf{x} \Vert
+\mathbf{x}\Vert^2  + \beta \mathbf{x}^TM^{-1}\mathbf{x} \]
+which is equivalent to the quadratic program:
+
+\begin{eqnarray*}
+\hat{\mathbf{x}}  & = & \arg\min_{\mathbf{x}\geq 0} -2\mathbf{y}^TA\mathbf{x} + \mathbf{x}^T(A^TA + \lambda_\mathbf{x} I)\mathbf{x} +
+\beta \mathbf{x}^TM^{-1}\mathbf{x} \\
+& = & \arg\min_{\mathbf{x}\geq 0} -2\mathbf{y}^TA\mathbf{x} + \mathbf{x}^T(A^TA + \lambda_\mathbf{x} I + \beta M^{-1})\mathbf{x}   \\
+\end{eqnarray*}
+
+\subsection*{Implementation}
+
+The R function \texttt{solve.QP} can solve any of the above quadratic programs.
+
+So, again working one gene at a time, we apply \texttt{solve.QP} solve
+the constrained minimization above to estimate the expression profile at
+the cell type level.
+
+```{r keyFunctions}
+#function to create pseudobulk from scRNA-Seq data
+createPseudoBulk <- function(scrna){
+  #create list of timepoints
+  timepoints <- unique(gsub(pattern = ".*_", replacement = "", colnames(scrna)))
+  
+  #create single-cell pseudo bulk data
+  pseudoBulk <- list()
+  for(t in timepoints){
+    #get single-cell rna-seq in this timepoint
+    curSC <- scrna[, grep(pattern = t, colnames(scrna))]
+    
+    #create pseudo-bulk by summing values
+    curPseudo <- rowSums(curSC)
+    curPseudo[is.na(curPseudo)] <- 0
+    
+    #log-transform and quantile normalize
+    #curPseudo <- log2(curPseudo+1)
+    #curPseudo <- preprocessCore::normalize.quantiles(as.matrix(curPseudo))
+    
+    #add current timepoint pseudo-bulk to list 
+    pseudoBulk[[t]] <- curPseudo
+    rm(curPseudo, curSC)
+  }
+  pseudoBulk <- data.frame(pseudoBulk)
+  rownames(pseudoBulk) <- rownames(scrna)
+  return(as.matrix(pseudoBulk))
+}
+
+#create seurat object for downstream clustering
+createSeurat <- function(counts){
+  # Initialize the Seurat object with the raw (non-normalized data).
+  seurat <- CreateSeuratObject(counts = counts, project = "EMT")
+  
+  #normalize data
+  seurat <- NormalizeData(seurat)
+  
+  #scale data
+  all.genes <- rownames(seurat)
+  seurat <- ScaleData(seurat, features = all.genes)
+  
+  #find most variable genes
+  seurat <- FindVariableFeatures(seurat, selection.method = "vst", nfeatures = 2000)
+  
+  #PCA on most variable genes
+  seurat <- RunPCA(seurat, features = VariableFeatures(object = seurat))
+  
+  #construct KNN using 10 PCs
+  seurat <- FindNeighbors(seurat, dims = 1:10)
+  
+  return(seurat)
+}
+
+#function to compute cell-type proportions 'A' given seurat-clustered data
+computeCellProportions <- function(seuratObject){
+  #construct matrix with number of cells from each type in each timepoint
+  A <- as.data.frame(seuratObject@assays$RNA@counts) %>% 
+    mutate(gene = rownames(.)) %>% 
+    melt() %>% 
+    mutate(cluster = Idents(seuratObject)[variable], timepoint = gsub(".*_","", variable)) %>% 
+    group_by(cluster, timepoint) %>% 
+    summarize(count = length(unique(variable))) %>% 
+    tidyr::spread(key = cluster, value = count, fill = 0) %>% 
+    tibble::column_to_rownames("timepoint")
+  
+  #convert to matrix format
+  A <- as.matrix(A)
+  
+  return(A)
+}
+```
+
+# Data summary - Proteomics
+
+The bulk proteomics data was generated in the Emili Lab using standard mass-spectrometry. Summary of the dataset follows:
+
+-   6,967 proteins
+-   10 different timepoints
+-   Three replicates
+
+The average intensity across replicates was computed for each protein in each timepoint. Timepoints 3 and 9 were removed since they are not present in the scRNA data. 
+
+```{r readProteome, fig.height = 3}
+#read in '2D' proteomics data and average replicates in each timepoint
+proteome <- fread("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/proteinGroups_Prot.txt") %>% 
+  as.data.frame() %>% 
+  .[, c("Gene names", grep("Reporter intensity corrected .* [A-C]", colnames(.), value = TRUE))] %>% 
+  magrittr::set_names(c("Gene", gsub("Reporter intensity corrected ", "T", colnames(.)[-1]))) %>% 
+  melt() %>% 
+  #average replicates
+  mutate(variable = gsub(" .*","", variable)) %>% 
+  group_by(Gene, variable) %>% 
+  summarize(intensity = mean(value)) %>% 
+  #convert to wide format
+  dcast(Gene ~ variable) %>% 
+  magrittr::set_rownames(.$Gene) %>% 
+  #remove timepoints that are not present in scRNA data
+  select(-c(1, 5, 11)) %>%
+  as.matrix()
+
+#normalize data such that each timepoint sums to 1
+#proteome <- apply(proteome, 2, function(x) return(x/sum(x)))
+
+#scale original matrix row-wise
+scaledProts <- t(apply(proteome, 1, scale)) %>% .[complete.cases(.),]
+
+#visualize heatmap
+ComplexHeatmap::Heatmap(scaledProts,
+                        name = "Intensity (scaled row-wise)", cluster_columns = FALSE, 
+                        column_split = colnames(proteome), 
+                        show_row_names = F, show_column_names = F, 
+                        use_raster = T, row_title = "Proteins")
+```
+
+# Data summary - scRNA-Seq
+
+The scRNA-Seq data was generated in the Emili Lab using standard mass-spectrometry. Summary of the dataset follows:
+
+-   9,785 genes
+-   1,913 cells (\~200 cells per timepoint)
+-   8 different timepoints
+
+Prior to this summation, genes with zero variance as well as those with non-zero counts in less than 5% of all cells were removed. This removed 17 genes (0.2% of all genes). The data was also normalized such that each cell sums to 1. 
+
+```{r readSCRNA}
+#read in data
+scrna <- data.frame(fread("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/scRNAseq_filt_dat.txt", stringsAsFactors = FALSE)) %>% 
+  magrittr::set_rownames(.$Gene.names) %>% 
+  select(-1)
+
+#compute variance of genes
+geneVar <- apply(scrna, 1, var) %>% 
+  .[. > 0]
+
+#remove genes with zero variance
+scrna <- scrna[names(geneVar),]
+
+#get percentage of cells each gene is expressed in
+cellsPerGene <- apply(scrna, 1, function(x) sum(x > 0) / length(x)) %>% 
+  .[. >= 0.05]
+
+#remove genes expressed in less than 5% of all cells
+scrna <- scrna[names(cellsPerGene),]
+
+#filter out lowly-expressed genes (threshold is at least 3 counts in 3 cells - removed 1,240 genes)
+scrna <- scrna[rowSums(scrna > 3) > 3,]
+
+#group scRNA data by cell and normalize to sum to 1
+scrna <- scrna %>% 
+  as.data.frame() %>% 
+  mutate(gene = rownames(.)) %>% 
+  melt() %>% 
+  group_by(variable) %>% 
+  mutate(value = value / sum(value)) %>%
+  dcast(gene ~ variable) %>% 
+  magrittr::set_rownames(.$gene) %>% 
+  select(-1) %>% 
+  as.data.frame()
+```
+
+\newpage
+
+# Protein overlap
+
+The venn diagram below shows the overlap of the identified proteins in the datasets. Only the genes that overlap between the two datasets are retained for downstream analysis.
+
+```{r proteinOverlap, fig.width = 5, fig.height = 4}
+#list of genes detected in each dataset
+allGenes <- list("scRNA-Seq" = rownames(scrna), "Proteomics" = rownames(proteome))
+
+#list of overlapping genes
+overlapGenes <- Reduce(intersect, allGenes)
+
+#retain overlapping genes only in the datasets
+scrna <- scrna[overlapGenes,]
+proteome <- proteome[overlapGenes,]
+
+#venn diagram
+ggvenn::ggvenn(data = allGenes,  columns = c("scRNA-Seq", "Proteomics"))
+```
+
+# Clustering scRNA data
+
+The scRNA data is clustered in an unsupervised manner based on similarity of gene expression profiles using *Seurat* into 10 clusters. All the 420 cells across the 8 timepoints were pooled together for this clustering. The plot on the right shows the proportion of each cell cluster in each timepoint.
+
+Note: this approach assumes the single-cell data accurately captures the sample heterogeneity. In practice, biased cell sampling upstream could lead to an inaccurate view of sample heterogeneity here.
+
+```{r clusterRNA, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
+#create seurat object
+seurat <- createSeurat(scrna)
+
+#cluster seurat object
+seurat <- FindClusters(seurat, resolution = 1.1, random.seed = 123, verbose = FALSE)
+
+#rename clusters to start from 1 instead of 0
+Idents(seurat) <- as.factor(as.numeric(as.character(Idents(seurat))) + 1)
+
+#UMAP dimensionality reduction
+seurat <- RunUMAP(seurat, dims = 1:10)
+
+#plot UMAP
+DimPlot(seurat, reduction = "umap", label = T) + ggtitle("Seurat-identified cell clusters")
+
+#create matrix A with counts of cell clusters in each timepoint
+A <- computeCellProportions(seurat)
+
+#convert cell type counts to proportions
+timeProportions <- data.frame(apply(A, 1, function(x) return(x/sum(x))))
+
+#convert to long format for ggplot
+timeProportions <- melt(timeProportions)
+colnames(timeProportions) <- c('Timepoint', 'Proportion')
+#timeProportions$Proportion <- round(timeProportions$Proportion, 2)
+
+#add column for cluster name
+timeProportions$Cell_State <- as.factor(rep(1:(length(unique(Idents(seurat)))), nrow(A)))
+
+#plot
+ggplot(timeProportions, aes(x = Timepoint, y = Proportion, fill = Cell_State,
+                            label = ifelse(Proportion > 0.015, paste0(round(Proportion*100),'%'), "") )) +
+  geom_bar(stat = 'identity') + 
+  geom_text(size = 2, position = position_stack(vjust = 0.5)) +
+  ggtitle("Cell state composition in each timepoint - scRNA") +
+  theme_bw()
+```
+
+
+# Validating the approach using pseudobulk data
+
+Prior to making inferences from the proteomics data, we first investigate the ability to recover the scRNA data from the bulk data at the RNA-level where we have the true single-cell profiles to compare against. The underlying principle of our model is that the bulk data is the  summation of the single-cell data, which can be represented using the simple formula $Bulk = Number\_of\_cells * Single\_cell\_expression$, for which we will use the notation $Y = AX$ throughout this report. The figure below shows a graphical representation of this model.
+
+
+![Schematic of single-cell deconvolution model](/Users/Ahmed/Documents/Emili_Lab/Aim%203/EMT%20Multi-omics/Plots/bulk%20decnovolution%20outline.png) 
+
+The process to to test our method on pseudobulk RNA data is detailed below:
+
+1) ***Clustering***:  The cell states in our dataset are identified in an unsupervised manner based on similarity of gene expression profiles. All cells from all timepoints are pooled together for this analysis. For data pre-processing, we remove the genes with low expression counts, retaining genes with a minimum of 3 counts in at least 3 cells. This removed 1,240 genes (13% of all genes). On average, each cell expressed ~3,600 genes after processing. [Seurat](https://www.nature.com/articles/nbt.4096) is then used to cluster the cells with their default workflow based on the 2,000 most variable genes. 
+
+2) ***Construct cell type proportions matrix A***: The timepoint \* cluster mixing matrix $A$ is constructed by counting the numbers of cell from each cluster in each timepoint.
+
+3) ***Construct cell cluster matrix X***: The cluster \* gene matrix $X$ is constructed by averaging the gene expression of each cluster.
+
+4) ***Create pseudo-bulk matrix Y***: Construct timepoint \* gene pseudobulk matrix $Y$ using the formula $Y = AX$.
+
+5) ***Predicting single-cell profiles***: Re-create the single-cell data from the pseudo-bulk data $Y$ using the method detailed in the methods section. To decide on the optimal value for the parameters $\lambda$ and $\beta$, we tested a range of 21 values between $1^{-10}$ to $1^{10}$ for each gene and each number of clusters. For each value of $\lambda$ and $\beta$, we computed the relative error in estimating each gene's single-cell profile as a measure of the accuracy of the predicted single-cell profile. The $\lambda$ and $\beta$ pairing that lead to the minimal error was selected as the optimal value.
+
+### Deconvolution results 
+
+```{r rnaPseudobulkDeconvolution, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
+#construct matrix with cell-type expression of each gene
+X <- scrna %>% 
+  mutate(gene = rownames(.)) %>% 
+  melt() %>% 
+  mutate(cluster = Idents(seurat)[variable]) %>% 
+  group_by(gene, cluster) %>% 
+  summarise(value = mean(value)) %>% 
+  dcast(gene ~ cluster) %>% 
+  magrittr::set_rownames(.$gene) %>% 
+  dplyr::select(-1) %>% 
+  as.matrix() %>% 
+  t()
+
+#reconstruct pseudo-bulk matrix
+Y <- A %*% X
+
+#read in pre-computed deconovlution results for 10-cluster scenario
+X_hat <- readRDS("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/geneBetasLambdas_10clusters.rds")
+
+#get best lambda for each beta-gene pairing
+pairErrors <- X_hat %>% 
+  filter(!is.na(Relative_error)) %>% 
+  group_by(Beta, Lambda) %>% 
+  summarise(Average_error = mean(Relative_error)) %>% 
+  mutate(Lambda = as.factor(Lambda), Beta = as.factor(Beta))
+
+#convert to matrix
+gridSearch <- reshape2::dcast(pairErrors, formula = Lambda ~ Beta, drop = F) %>% 
+  column_to_rownames("Lambda") %>% 
+  .[order(as.numeric(as.character(rownames(.)))),] %>% 
+  round(., 2) %>% 
+  set_rownames(paste('$lambda :', rownames(.))) %>% 
+  set_colnames(paste('$beta :', colnames(.)))
+  
+#get best pairing
+bestLambda <- as.numeric(as.character(
+  unlist(pairErrors[pairErrors$Average_error == min(pairErrors$Average_error), "Lambda"])))[1]
+bestBeta <- as.numeric(as.character(
+  unlist(pairErrors[pairErrors$Average_error == min(pairErrors$Average_error), "Beta"])))[1]
+
+#subset to values from best beta
+optimalBetasLambdas <- X_hat %>% 
+  filter(Beta == bestBeta, Lambda == bestLambda, !is.infinite(Relative_error))
+
+#predict single-cell profiles 
+prediction <- optimalBetasLambdas[, tail(colnames(optimalBetasLambdas), n = 10)] %>% 
+  as.data.frame() %>% 
+  set_rownames(make.unique(optimalBetasLambdas$Gene))
+
+#remove zero variance genes
+prediction <- prediction[,unlist(apply(prediction, 2, var)) > 0]
+
+#add cluster labels
+colnames(prediction) <- paste0("cluster_", 1:(length(unique(Idents(seurat)))))
+
+#visualize
+pheatmap(t(Y), scale = "row", show_rownames = F, cluster_cols = F, main = "RNA Pseudobulk", name = "Z-score")
+pheatmap(prediction, scale = "row", show_rownames = F, cluster_cols = F, main = "Deconvoluted RNA Pseudobulk", name = "Z-score")
+```
+### Comparing predicted cluster centroids to real ones
+
+The below UMAP plots include the centroid of each cluster in each dataset. The centroid is computed as the average abundance of each protein in each cluster's cells. 
+
+```{r umapWithOnlyOneBetaLambda, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold',fig.width = 8}
+#change names of clusters
+rownames(X) <- paste0("real_", seq(nrow(X)))
+colnames(prediction) <- paste0("predicted_", seq(ncol(prediction)))
+
+#get overlap of matrices
+predictionOverlap <- intersect(rownames(prediction), colnames(X))
+
+#center and scale rows of each matrix
+scaledReal <- (scale(t(X[,predictionOverlap]), center = TRUE, scale = TRUE))
+scaledPrediction <- (scale(prediction[predictionOverlap,], center = TRUE, scale = TRUE))
+
+#merge centroids to one table
+mergedCentroids <- cbind(scaledReal, scaledPrediction)
+mergedCentroids <- cbind(t(X[,predictionOverlap]), prediction[predictionOverlap,])
+
+#normalize cluster centroids to sum to 1 in each cluster
+#mergedCentroids <- apply(mergedCentroids, 2, function(x) return(x / sum(x)))
+
+#UMAP
+set.seed(123)
+mergedCentroidsUmap <- as.data.frame(uwot::umap(t(mergedCentroids), n_neighbors = ncol(mergedCentroids))) %>%
+  mutate(cluster = gsub("[[:alpha:]]|_", "", colnames(mergedCentroids)),
+         data = c(rep("real", ncol(scaledReal)), rep("predicted", ncol(scaledPrediction))))
+
+#plot
+ggplot(mergedCentroidsUmap, aes(x = V1, y = V2, color = cluster, shape = data)) +
+  geom_point(size = 8) +
+  labs(title = "Combined UMAP of real and predicted scRNA cluster centroids") +
+  theme_bw()
+
+
+#sort matrices to all follow the same order of genes
+overlapGenes <- Reduce(intersect, list(rownames(scrna), colnames(X), rownames(prediction)))
+scrna <- scrna[overlapGenes, ]
+X <- X[, overlapGenes]
+prediction <- prediction[overlapGenes,]
+
+#concatenate centroids to single-cell expression matrix
+mergedSC <- rbind(t(scrna), X, t(prediction))
+
+#UMAP
+set.seed(123)
+umap <- as.data.frame(uwot::umap(mergedSC))
+
+#add label indicating whether point is a centroid
+umap$centroid <- c(rep("cell", ncol(scrna)), rep("real centroid", nrow(X)), rep("predicted centroid", ncol(prediction)))
+
+#add label indicating cell cluster
+umap$cluster <- c(rep(NA, ncol(scrna)), rep(1:nrow(X), 2))
+
+#plot centroid umap
+ggplot(umap, aes(x = V1, y = V2, col = centroid)) +
+  geom_point() +
+  ggrepel::geom_label_repel(label = umap$cluster) + 
+  scale_color_manual(values = c("grey", "red", "blue"), name = "Key") +
+  theme_classic() +
+  ggtitle("UMAP visualization of the predicted and real cell cluster centroids")
+```
+
+## Mapping predicted clusters to real clusters - LSAP
+
+In this section, we map the cluster centroids by solving the linear sum assignment problem (*LSAP*) using the Hungarian method as implemented in the [`solve_LSAP()`](https://www.rdocumentation.org/packages/clue/versions/0.3-60/topics/solve_LSAP) function in the [*clue* R package](https://cran.r-project.org/web/packages/clue/vignettes/clue.pdf). In summary, the LSAP algorithm expects similarities between cluster centroids as the entries in the input matrix. The idea of the matching is that given two sets A and B, we find the matching that maximizes $sum(similarity(a_i, b_j))$ where $a_i$ is matched with $b_j$. *Each member of the set is matched with exactly one member of the other set.*
+
+The algorithm is run twice:
+
+1) Using the Euclidean distance as the similarity metric for the cluster centroids, where the algorithm will minimize the sum of assigned euclidean distances.
+2) Using the Pearson correlation as the similarity metric for the cluster centroids. The correlations are converted to distances to become non-negative, and the algorithm will minimize the sum of assigned distances
+
+```{r lsapOneBetaLambda, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold',fig.width = 10}
+#compute euclidean distance between cluster centroids
+centroidDistances <- round(as.matrix(dist(t(mergedCentroids), method = "euclidean")), 2) %>%
+  .[grep("real", rownames(.)), grep("predicted", colnames(.))]
+
+#convert centroid self-distances to max possible to avoid assigning clusters to themselves
+#centroidDistances[row(centroidDistances) == col(centroidDistances)] <- .Machine$double.xmax
+
+#solve LSAP
+lsap <- clue::solve_LSAP(centroidDistances, maximum = FALSE)
+
+#find closest centroid for each centroid
+mappingEuclideanLSAP <- data.frame(from = rownames(centroidDistances), to = colnames(centroidDistances)[lsap[1:length(lsap)]])
+
+#create matrix with node attributes
+nodeAttributes <- data.frame(Cluster = c(rownames(centroidDistances), colnames(centroidDistances)),
+                             x = c(rep(1, ncol(scaledReal)), rep(2, ncol(scaledPrediction))),
+                             y = rep(1:ncol(scaledReal), 2),
+                             color =  c(rep("#69B3A2", ncol(scaledReal)), rep("#9F2B68", ncol(scaledPrediction))),
+                             label = c(1:(ncol(scaledReal)), 1:(ncol(scaledPrediction))))
+
+#plot bipartite graph
+mygraph <- igraph::graph_from_data_frame(mappingEuclideanLSAP, directed = TRUE, vertices = nodeAttributes)
+plot(mygraph, vertex.label.color = "white",
+     main = paste("LSAP Mapping - Euclidean distance - Total distance:", round(sum(centroidDistances[cbind(seq_along(lsap), lsap)]), 2)))
+legend("topright", legend = c("Real", "Predicted"),
+       bty = "n", fill = c("#69B3A2", "#9F2B68"))
+
+
+#compute pearson correlations between cluster centroids
+centroidCors <- WGCNA::cor(mergedCentroids) %>%
+  .[grep("real", rownames(.)), grep("predicted", colnames(.))]
+
+#compute correlations to distances
+centroidCors <- 1 - centroidCors
+
+#convert centroid self-distances to max possible to avoid assigning clusters to themselves
+#centroidCors[row(centroidCors) == col(centroidCors)] <- .Machine$double.xmax
+
+#solve LSAP
+lsap <- clue::solve_LSAP(centroidCors, maximum = FALSE)
+
+#find closest centroid for each centroid
+mappingPearsonLSAP <- data.frame(from = rownames(centroidCors), to = colnames(centroidCors)[lsap[1:length(lsap)]])
+
+#plot bipartite graph
+mygraph <- igraph::graph_from_data_frame(mappingPearsonLSAP, directed = TRUE, vertices = nodeAttributes)
+plot(mygraph, vertex.label.color = "white",
+     main = paste("LSAP Mapping - Pearson distance - Total distance:", round(sum(centroidCors[cbind(seq_along(lsap), lsap)]), 2)))
+legend("topright", legend = c("Real", "Predicted"),
+       bty = "n", fill = c("#69B3A2", "#9F2B68"))
+```
+\newpage
+
+# Testing method with single-cell proteomics data
+
+To aid as an external benchmark of our method, the Nikolai Slavov group at Northeastern University shared with us a MS-derived single-cell proteomics dataset from cells undergoing EMT. Their experimental setup consists of three timepoints (days 0, 3, and 9), and the data has 1,827 genes x 420 cells, out of which 1,064 genes, including 27 of the [EMT hallmark genes]((https://www.gsea-msigdb.org/gsea/msigdb/cards/HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION.html)), were also detected in our own data. For all downstream analysis, only the set of ~1,000 genes that overlap between the single-cell proteomics, bulk proteomics, and scRNA-Seq datasets are retained. Notably, 65% of the original single-cell proteomics matrix consists of missing values. 
+
+Data Summary: 
+
+* 1,776 proteins
+* 420 cells
+* 205 proteins detected in every single cell
+* 605 proteins detected in each cell on average (Range: 528 - 702)
+* Each protein is present in 145 cells on average with a median of 49 cells (IQR 11 - 315 cells)
+
+# KNN Imputation
+
+The [Specht et al](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-021-02267-5#Sec16) publication proposed a strategy to impute the missing values by k-nearest neighbor imputation (k = 3) using Euclidean distance as a similarity measure between the cells. Briefly, for a given missing value, the expression of that gene in that cell is taken as the mean of it’s expression in the 3 most similar cells for which it’s expression is present. The key parameter for this KNN algorithm is the number of neighbors $K$. We select the $K$ based on a five-fold cross-validation within the training dataset and computing the resultant mean absolute prediction error on the held out non-missing values. The optimal value for $K$ was shown to be 10.
+
+#### Clustering
+
+```{r knnClustering, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
+#read in sc protein values
+scProt <- read.delim("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/Slavov sc proteomics/slavov_sc_proteomics_emt_raw_protein.txt", row.names = 1)
+
+#read in UniProt ID mappings
+uniprot <- fread("/Users/Ahmed/Documents/Emili_Lab/PPI Databases/UniProt ID mapping/uniprot_human_mapping.csv")
+uniprot <- setNames(uniprot$gene_symbol, uniprot$uniprot)
+
+#map UniProt IDs to gene symbols in sc proteomics dataset
+rownames(scProt) <- make.unique(gsub(pattern = "-.*", "", rownames(scProt)))
+mappings <- uniprot[rownames(scProt)]
+scProt <- scProt[!is.na(mappings),]
+rownames(scProt) <- make.unique(mappings[!is.na(mappings)])
+
+#read in cell timepoint labels
+cellLabels <- unique(fread("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/Slavov sc proteomics/slavov_sc_proteomics_emt_filtered_cells.txt", drop = 1)[, c("id", "celltype")]) %>% 
+  filter(id %in% colnames(scProt))
+
+#create new cell labels combining cell ID and timepoint
+cellLabels$key <- paste(cellLabels$id, cellLabels$celltype, sep = "_") 
+
+#order cells based on timepoint
+cellLabels <- cellLabels[order(cellLabels$celltype),]
+
+#create vector with cell ID mapping
+cellLabels <- setNames(cellLabels$key, cellLabels$id)
+
+#change column names of matrix to include cell labels
+colnames(scProt) <- cellLabels[colnames(scProt)]
+
+#sort cells by timepoint
+scProt <- scProt[, cellLabels]
+
+
+#imputation function (originally called hknn) modified from https://github.com/SlavovLab/SCoPE2/blob/master/code/functions_parameters.R
+knn_imputation<-function(dat, k, distanceMetric = c("euclidean", "pearson")){
+  # Create a copy of the data, NA values to be filled in later
+  dat <- as.matrix(dat)
+  dat.imp <- dat
+  
+  # Calculate similarity metrics for all column pairs
+  if(distanceMetric == "euclidean"){
+    dist.mat <- as.matrix(dist(t(dat)))
+  }
+  if(distanceMetric == "pearson"){
+    dist.mat <- 1 - cor(dat, use = "pairwise.complete.obs")
+  }
+  
+  # Column names of the similarity matrix, same as data matrix
+  cnames <- colnames(dist.mat)
+  
+  # For each column (aka cell) in the data... 
+  for(X in cnames){
+    
+    # Find the distances of all other columns to that column 
+    distances <- dist.mat[, X]
+    # Reorder the distances, smallest to largest (this will reorder the column names as well)
+    distances.ordered <- distances[order(distances, decreasing = F)]
+    # Reorder the data matrix columns, smallest distance to largest from the column of interest
+    dat.reordered <- dat[ , names(distances.ordered) ]
+    # Take the values in the column of interest
+    vec <- dat[, X]
+    # Which entries are missing and need to be imputed...
+    na.index <- which( is.na(vec) )
+    
+    # For each of the missing entries (rows) in column X...
+    for(i in na.index){
+      # Find the most similar columns that have a non-NA value in this row
+      closest.columns <- names( which( !is.na(dat.reordered[i, ])  ) )
+      # If there are more than k such columns, take the first k most similar
+      if( length(closest.columns)>k ){
+        # Replace NA in column X with the mean the same row in k of the most similar columns
+        vec[i]<-mean( dat[ i, closest.columns[1:k] ] )
+      }
+      # If there are less that or equal to k columns, take all the columns
+      if( length(closest.columns)<=k ){
+        # Replace NA in column X with the mean the same row in all of the most similar columns
+        vec[i]<-mean( dat[ i, closest.columns ] )
+      }
+    }
+    
+    # Populate a the matrix with the new, imputed values
+    dat.imp[,X] <- vec
+  }
+  return(dat.imp)
+}
+
+#read in NMF rank error results
+knnErrors <- readRDS("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/knn_imputation_errors.rds")
+
+#get best KNN rank
+optimalKNN <- knnErrors %>% 
+  group_by(K) %>% 
+  summarise(error = mean(Error, na.rm=T)) %>% 
+  ungroup() %>% 
+  filter(error == min(error))
+
+#knn imputation
+knn <- knn_imputation(scProt, k = optimalKNN$K)
+
+#create seurat object
+seurat <- createSeurat(knn)
+
+#cluster seurat object
+seurat <- FindClusters(seurat, resolution = 0.6, random.seed = 123, verbose = FALSE)
+
+#UMAP dimensionality reduction
+seurat <- RunUMAP(seurat, dims = 1:10)
+
+#plot UMAP
+DimPlot(seurat, reduction = "umap", label = T, pt.size = 3) + ggtitle("Seurat-identified SC Proteomics cell clusters")
+
+#create matrix A with counts of cell clusters in each timepoint
+A <- computeCellProportions(seurat)
+
+#convert cell type counts to proportions
+timeProportions <- data.frame(apply(A, 1, function(x) return(x/sum(x))))
+
+#convert to long format for ggplot
+timeProportions <- melt(timeProportions)
+colnames(timeProportions) <- c('Timepoint', 'Proportion')
+timeProportions$Proportion <- round(timeProportions$Proportion, 2)
+
+#add column for cluster name
+timeProportions$Cell_State <- as.factor(rep(0:(length(unique(Idents(seurat)))-1), nrow(A)))
+
+#plot
+ggplot(timeProportions, aes(x = Timepoint, y = Proportion, fill = Cell_State,
+                            label = ifelse(Proportion > 0.015, paste0(Proportion*100,'%'), "") )) +
+  geom_bar(stat = 'identity') + 
+  geom_text(size = 2, position = position_stack(vjust = 0.5)) +
+  ggtitle("Cell state composition in each timepoint - KNN-imputed SC Proteomics") +
+  theme_bw()
+```
+
+#### Deconvolution results
+
+```{r knnproteomicsHeatmap, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold', fig.width = 12, fig.height = 10}
+#construct matrix with cell-type expression of each gene
+X <- knn %>% 
+  as.data.frame() %>% 
+  mutate(gene = rownames(.)) %>% 
+  melt() %>% 
+  mutate(cluster = Idents(seurat)[variable]) %>% 
+  group_by(gene, cluster) %>% 
+  summarise(value = mean(value)) %>% 
+  dcast(gene ~ cluster) %>% 
+  magrittr::set_rownames(.$gene) %>% 
+  dplyr::select(-1) %>% 
+  as.matrix() %>% 
+  t()
+
+#reconstruct pseudo-bulk matrix
+Y <- A %*% X
+
+#read in pre-computed deconovlution results for 10-cluster scenario
+X_hat <- readRDS("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/KNNproteinBetasLambdas_5clusters.rds")
+
+#subset table to optimal values for current clustering
+optimalLambdas <- X_hat %>% 
+  group_by(Gene) %>% 
+  filter(Relative_error == min(Relative_error)) %>% 
+  filter(!is.infinite(Relative_error))
+
+#predict single-cell profiles 
+#prediction <- optimalLambdas[, tail(colnames(optimalLambdas), n = nrow(X))] %>% 
+#  as.data.frame() %>% 
+ # set_rownames(make.unique(optimalLambdas$Gene))
+
+#remove zero variance genes
+#prediction <- prediction[,unlist(apply(prediction, 2, var)) > 0]
+
+#add cluster labels
+#colnames(prediction) <- paste0("cluster_", 1:(length(unique(Idents(seurat)))))
+
+#visualize
+pheatmap(t(Y), scale = "row", show_rownames = F, cluster_cols = F,
+         main = "SC Proteomics pseudobulk to be deconvoluted", name = "Z-score")
+#pheatmap(prediction, scale = "row", show_rownames = F, cluster_cols = F, main = "Deconvoluted sc proteomics pseudobulk")
+
+#get best lambda for each beta-gene pairing
+pairErrors <- X_hat %>% 
+  filter(!is.na(Relative_error)) %>% 
+  group_by(Beta, Lambda) %>% 
+  summarise(Average_error = mean(Relative_error)) %>% 
+  mutate(Lambda = as.factor(Lambda), Beta = as.factor(Beta))
+
+#convert to matrix
+gridSearch <- reshape2::dcast(pairErrors, formula = Lambda ~ Beta, drop = F) %>% 
+  column_to_rownames("Lambda") %>% 
+  .[order(as.numeric(as.character(rownames(.)))),] %>% 
+  round(., 2) %>% 
+  set_rownames(paste('$lambda :', rownames(.))) %>% 
+  set_colnames(paste('$beta :', colnames(.)))
+  
+#get best pairing
+bestLambda <- as.numeric(as.character(
+  unlist(pairErrors[pairErrors$Average_error == min(pairErrors$Average_error), "Lambda"])))[1]
+bestBeta <- as.numeric(as.character(
+  unlist(pairErrors[pairErrors$Average_error == min(pairErrors$Average_error), "Beta"])))[1]
+
+#subset to values from best beta
+optimalBetasLambdas <- X_hat %>% 
+  filter(Beta == bestBeta, Lambda == bestLambda, !is.infinite(Relative_error))
+
+#predict single-cell profiles 
+prediction <- optimalBetasLambdas[, tail(colnames(optimalBetasLambdas), n = nrow(X))] %>% 
+  as.data.frame() %>% 
+  set_rownames(make.unique(optimalBetasLambdas$Gene))
+
+#remove zero variance genes
+prediction <- prediction[,unlist(apply(prediction, 2, var)) > 0]
+
+#change names of clusters
+rownames(X) <- paste0("real_", seq(nrow(X)))
+colnames(prediction) <- paste0("predicted_", seq(ncol(prediction)))
+
+pheatmap(prediction, scale = "row", show_rownames = F, cluster_cols = F,
+         main = "Deconvoluted SC Proteomics Pseudobulk", name = "Z-score")
+```
+
+#### Comparing predicted and real centroids
+
+```{r KNNproteomicsUmaps, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold', fig.width = 8}
+#get overlap of matrices
+predictionOverlap <- intersect(rownames(prediction), colnames(X))
+
+#center and scale rows of each matrix
+scaledReal <- (scale(t(X[,predictionOverlap]), center = TRUE, scale = TRUE))
+scaledPrediction <- (scale(prediction[predictionOverlap,], center = TRUE, scale = TRUE))
+
+#merge centroids to one table
+mergedCentroids <- cbind(scaledReal, scaledPrediction)
+mergedCentroids <- cbind(t(X[,predictionOverlap]), prediction[predictionOverlap,])
+
+#normalize cluster centroids to sum to 1 in each cluster
+#mergedCentroids <- apply(mergedCentroids, 2, function(x) return(x / sum(x)))
+
+#UMAP
+set.seed(123)
+mergedCentroidsUmap <- as.data.frame(uwot::umap(t(mergedCentroids), n_neighbors = ncol(mergedCentroids))) %>%
+  mutate(cluster = gsub("[[:alpha:]]|_", "", colnames(mergedCentroids)),
+         data = c(rep("real", ncol(scaledReal)), rep("predicted", ncol(scaledPrediction))))
+
+#plot
+ggplot(mergedCentroidsUmap, aes(x = V1, y = V2, color = cluster, shape = data)) +
+  geom_point(size = 8) +
+  labs(title = "Combined UMAP of real and predicted SC Proteomics cluster centroids") +
+  theme_bw()
+
+
+#sort matrices to all follow the same order of genes
+overlapGenes <- Reduce(intersect, list(rownames(knn), colnames(X), rownames(prediction)))
+knn <- knn[overlapGenes, ]
+X <- X[, overlapGenes]
+prediction <- prediction[overlapGenes,]
+
+#concatenate centroids to single-cell expression matrix
+mergedSC <- rbind(t(knn), X, t(prediction))
+
+#UMAP
+set.seed(123)
+umap <- as.data.frame(uwot::umap(mergedSC))
+
+#add label indicating whether point is a centroid
+umap$centroid <- c(rep("cell", ncol(scProt)), rep("real centroid", nrow(X)), rep("predicted centroid", ncol(prediction)))
+
+#add label indicating cell cluster
+umap$cluster <- c(rep(NA, ncol(scProt)), rep(1:nrow(X), 2))
+
+#plot centroid umap
+ggplot(umap, aes(x = V1, y = V2, col = centroid)) +
+  geom_point() +
+  ggrepel::geom_label_repel(label = umap$cluster) + 
+  scale_color_manual(values = c("grey", "red", "blue"), name = "Key") +
+  theme_classic() +
+  ggtitle("UMAP visualization of the predicted and real cell cluster centroids")
+```
+
+```{r KNNlsapProteomics, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold',fig.width = 10}
+#compute euclidean distance between cluster centroids
+centroidDistances <- round(as.matrix(dist(t(mergedCentroids), method = "euclidean")), 2) %>%
+  .[grep("real", rownames(.)), grep("predicted", colnames(.))]
+
+#convert centroid self-distances to max possible to avoid assigning clusters to themselves
+#centroidDistances[row(centroidDistances) == col(centroidDistances)] <- .Machine$double.xmax
+
+#solve LSAP
+lsap <- clue::solve_LSAP(centroidDistances, maximum = FALSE)
+
+#find closest centroid for each centroid
+mappingEuclideanLSAP <- data.frame(from = rownames(centroidDistances), to = colnames(centroidDistances)[lsap[1:length(lsap)]])
+
+#create matrix with node attributes
+nodeAttributes <- data.frame(Cluster = c(rownames(centroidDistances), colnames(centroidDistances)),
+                             x = c(rep(1, ncol(scaledReal)), rep(2, ncol(scaledPrediction))),
+                             y = rep(1:ncol(scaledReal), 2),
+                             color =  c(rep("#69B3A2", ncol(scaledReal)), rep("#9F2B68", ncol(scaledPrediction))),
+                             label = c(1:(ncol(scaledReal)), 1:(ncol(scaledPrediction))))
+
+#plot bipartite graph
+mygraph <- igraph::graph_from_data_frame(mappingEuclideanLSAP, directed = TRUE, vertices = nodeAttributes)
+plot(mygraph, vertex.label.color = "white",
+     main = paste("LSAP Mapping - Euclidean distance - Total distance:", round(sum(centroidDistances[cbind(seq_along(lsap), lsap)]), 2)))
+legend("topright", legend = c("Real", "Predicted"),
+       bty = "n", fill = c("#69B3A2", "#9F2B68"))
+
+
+#compute pearson correlations between cluster centroids
+centroidCors <- WGCNA::cor(mergedCentroids) %>%
+  .[grep("real", rownames(.)), grep("predicted", colnames(.))]
+
+#compute correlations to distances
+centroidCors <- 1 - centroidCors
+
+#convert centroid self-distances to max possible to avoid assigning clusters to themselves
+#centroidCors[row(centroidCors) == col(centroidCors)] <- .Machine$double.xmax
+
+#solve LSAP
+lsap <- clue::solve_LSAP(centroidCors, maximum = FALSE)
+
+#find closest centroid for each centroid
+mappingPearsonLSAP <- data.frame(from = rownames(centroidCors), to = colnames(centroidCors)[lsap[1:length(lsap)]])
+
+#plot bipartite graph
+mygraph <- igraph::graph_from_data_frame(mappingPearsonLSAP, directed = TRUE, vertices = nodeAttributes)
+plot(mygraph, vertex.label.color = "white",
+     main = paste("LSAP Mapping - Pearson distance - Total distance:", round(sum(centroidCors[cbind(seq_along(lsap), lsap)]), 2)))
+legend("topright", legend = c("Real", "Predicted"),
+       bty = "n", fill = c("#69B3A2", "#9F2B68"))
+```
+
+\newpage
+
+# Deconvolution of bulk proteomics using scRNA-defined cell clusters
+
+Now that we've validated our algorithm using the pseudobulk data, we applied our novel deconvolution algorithm to the bulk proteomics data with the scRNA-defined cell proportions matrix defined in the previous sections, setting the parameters $\lambda$ and $\beta$ to $1^{-7}$ and $1^{-4}$ respectively based on tuning results obtained from deconvoluting pseudobulk data.
+
+### Deconvolution results
+
+Note: The deconvoluted proteomics heatmap below was first normalized by dividing each cluster's values by the number of cells in that cluster, followed by cross-cluster scaling.
+
+```{r deconvolutionInputs, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
+#create seurat object
+seurat <- createSeurat(scrna)
+
+#cluster seurat object
+seurat <- FindClusters(seurat, resolution = 1.1, random.seed = 123, verbose = FALSE)
+
+#rename clusters to start from 1 instead of 0
+Idents(seurat) <- as.factor(as.numeric(as.character(Idents(seurat))) + 1)
+
+#UMAP dimensionality reduction
+seurat <- RunUMAP(seurat, dims = 1:10)
+
+#heatmap
+pheatmap(t(Y), scale = "row", show_rownames = F, cluster_cols = F,
+         main = "Bulk proteomics to be deconvoluted", name = "Z-score")
+
+#create matrix A with counts of cell clusters in each timepoint
+A <- computeCellProportions(seurat)
+
+#convert cell type counts to proportions
+timeProportions <- data.frame(apply(A, 1, function(x) return(x/sum(x))))
+
+#convert to long format for ggplot
+timeProportions <- melt(timeProportions)
+colnames(timeProportions) <- c('Timepoint', 'Proportion')
+timeProportions$Proportion <- round(timeProportions$Proportion, 2)
+
+#add column for cluster name
+timeProportions$Cell_State <- as.factor(rep(1:(length(unique(Idents(seurat)))), nrow(A)))
+
+#plot time proportions
+ggplot(timeProportions, aes(x = Timepoint, y = Proportion, fill = Cell_State,
+                            label = ifelse(Proportion > 0.015, paste0(round(Proportion*100),'%'), "") )) +
+  geom_bar(stat = 'identity') + 
+  geom_text(size = 2, position = position_stack(vjust = 0.5)) +
+  ggtitle("Cell state composition in each timepoint - scRNA") +
+  theme_bw()
+
+#construct matrix with cell-type expression of each gene
+X <- scrna %>% 
+  mutate(gene = rownames(.)) %>% 
+  melt() %>% 
+  mutate(cluster = Idents(seurat)[variable]) %>% 
+  group_by(gene, cluster) %>% 
+  summarise(value = mean(value)) %>% 
+  dcast(gene ~ cluster) %>% 
+  magrittr::set_rownames(.$gene) %>% 
+  dplyr::select(-1) %>% 
+  as.matrix() %>% 
+  t()
+
+#construct matrix Y as the bulk proteome
+Y <- t(proteome)
+
+#define required matrices/vectors for the quadratic solver
+Dmat <- t(A) %*% A
+Amat <- diag(ncol(A))
+M <- cor(apply(X, 1, scale))
+
+#set regeression parameters
+lambda <- 1e-7
+beta <- 1e-4
+
+#add regularization parameters
+Dmat <- Dmat + (lambda * diag(nrow(Dmat))) + (beta * solve(M))
+
+#to avoid overflow cause by large values, scale Dmat and dvec
+scalingFactor <- norm(Dmat, "2")
+
+#apply regression gene-by-gene
+prediction <- t(apply(Y, 2, function(curGene){
+  #define required matrices/vectors for the quadratic solver
+  dvec <- t(A) %*% curGene
+  
+  #solve quadratic equation
+  return(quadprog::solve.QP(Dmat / scalingFactor, dvec / scalingFactor, Amat)$solution)
+}))
+
+#remove zero variance genes
+prediction <- prediction[unlist(apply(prediction, 1, var)) > 0,]
+Y <- Y[, unlist(apply(Y, 2, var)) > 0]
+
+#add cluster labels
+colnames(prediction) <- paste0("cluster_", 1:(length(unique(Idents(seurat)))))
+
+#visualize
+pheatmap(t(t(prediction) / as.numeric(table(Idents(seurat)))), scale = "row", show_rownames = F, cluster_cols = T, main = "Deconvoluted proteomics", name = "Z-score")
+```
+
+## Classification of cell clusters
+
+Each of the 10 clusters identified in the previous step are classified into one of three categories based on their change in proportions across time: Epithelial (E), Mesenchymal (M), or Intermediate (I). The clusters with their maximum count in the first 2 timepoints were labeled *E*, and those in the last 3 timepoints were labeled *M*, with the rest being *I*.
+
+The following classifications were assigned:
+
+* Epithelial clusters: 2, 5, 9, 10 
+* Intermediate clusters: 6, 8 
+* Mesenchymal clusters: 1, 3, 4, 7 
+
+
+```{r classifyCellTypes, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
+#list of cell cluster classifications
+clusterClassifications <- list("E" = c(2, 5, 9, 10), "I" = c(6, 8), "M" = c(1, 3, 4, 7)) %>% melt()
+clusterClassifications <- setNames(clusterClassifications$L1, clusterClassifications$value)
+seurat@meta.data$classification <- clusterClassifications[as.character(as.numeric(as.character(seurat@meta.data$seurat_clusters))+1)]
+
+#UMAP indicating cluster classifications
+DimPlot(seurat, reduction = "umap", group.by = "classification", label = F) + ggtitle("Classification of Seurat-identified cell clusters")
+```
+
+
+# EMT hallmark genes
+
+We focus on a set of 81 hallmark genes associated with EMT from the [MSigDB database](https://www.gsea-msigdb.org/gsea/msigdb/cards/HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION.html). The heatmaps are divided into 3 sections: E, I, and M.  Note: The deconvoluted proteomics below was first normalized by dividing each cluster's values by the number of cells in that cluster, followed by cross-cluster scaling.
+
+```{r hallmark, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
+#read in EMT hallmark genes
+hallmark <- read.delim("/Users/Ahmed/Documents/Emili_Lab/Aim 3/EMT Multi-omics/Data/hallmark_emt_geneset.txt", header = F)[,1]
+
+#keep overlapping hallmark genes
+hallmark <- intersect(hallmark, intersect(colnames(Y), rownames(prediction)))
+
+#normalize by no. of cells in each cluster for heatmap
+normalizedPrediction <- t(t(prediction) / as.numeric(table(Idents(seurat))))
+
+#re-order E to M
+X <- X[names(clusterClassifications),]
+normalizedPrediction <- normalizedPrediction[,as.numeric(names(clusterClassifications))]
+
+#new heatmaps
+pheatmap(prediction[hallmark, as.numeric(names(clusterClassifications))], scale = "row", show_rownames = F, cluster_cols = F, gaps_col = c(4, 6), main = "EMT Hallmarks - Deconvoluted proteomics", name = "Z-score")
+pheatmap(t(X[,hallmark]), scale = "row", show_rownames = F, cluster_cols = F, gaps_col = c(4, 6), main = "EMT Hallmarks - Clustered scRNA", name = "Z-score")
+```
+# Focused set of known E/M markers
+
+The below heatmaps show the expression patterns for a smaller subset of 4 known E markers and 4 known M markers in both the original single-cell RNA and the deconvoluted single-cell proteomics data. Note: no normalization was applied to the data.
+
+```{r smallerFocusHallmark, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold'}
+#subset of known epithelial/mesenchymal markers
+E <- c("SDC1", "RHOB", "GPC1", "SDC4")
+M <- c("VIM", "FN1", "PLOD1", "FLNA")
+
+#heatmaps
+pheatmap(prediction[E, as.numeric(names(clusterClassifications))], scale = "row", show_rownames = T, cluster_cols = F, gaps_col = c(4, 6), main = "E markers - Deconvoluted proteomics", name = "Z-score")
+pheatmap(t(X[,E]), scale = "row", show_rownames = T, cluster_cols = F, gaps_col = c(4, 7), main = "E markers - Clustered scRNA", name = "Z-score")
+
+pheatmap(prediction[M, as.numeric(names(clusterClassifications))], scale = "row", show_rownames = T, cluster_cols = F, gaps_col = c(4, 6), main = "M markers - Deconvoluted proteomics", name = "Z-score")
+pheatmap(t(X[,M]), scale = "row", show_rownames = T, cluster_cols = F, gaps_col = c(4, 7), main = "M markers - Clustered scRNA", name = "Z-score")
+```
+
+# Pathway enrichment across predicted cluster centroids
+
+For each cluster, we extract the proteins with a log2 fold-change of at least 1.5 between the cluster and all the other ones, as the set of markers for the cluster in the predicted single-cell proteomics data. The number of markers per cluster varied from 3 (cluster 2) to 198 (cluster 3). We then use the [*enrichR* tool](https://maayanlab.cloud/Enrichr/) to compute the enrichment score for each cluster's markers across the set of [MSigDB hallmark gene sets](https://www.gsea-msigdb.org/gsea/msigdb/collections.jsp).
+
+```{r allHallmarksEnrichment, out.width = '.49\\linewidth', fig.align = 'center', fig.show = 'hold', fig.width = 12, fig.height = 9}
+# Initialize the Seurat object with the raw (non-normalized data).
+seuratProt <- CreateSeuratObject(counts = prediction, project = "EMT Deconvoluted Proteomics")
+
+#normalize data
+seuratProt <- NormalizeData(seuratProt)
+
+#scale data
+seuratProt <- ScaleData(seuratProt, features = rownames(seuratProt))
+
+#assign cluster labels
+Idents(seuratProt) <- 1:ncol(prediction)
+
+#get all markers
+allMarkers <- pblapply(unique(Idents(seuratProt)), function(x){
+  curMarkers <- Seurat::FindMarkers(seuratProt, ident.1 = as.numeric(x), min.cells.feature = 1, min.cells.group = 1) %>% 
+    arrange(avg_log2FC) %>% 
+    filter(avg_log2FC > 1.5) %>% 
+    mutate(Cluster = as.numeric(x), gene = rownames(.))
+  return(curMarkers)
+}, cl = 6) %>% 
+  do.call("rbind", .)
+
+#show no. of markers for each cluster
+kable(allMarkers %>% group_by(Cluster) %>% summarise(Markers = n()) %>%
+        mutate(Classification = clusterClassifications[as.character(sort(as.numeric(names(clusterClassifications))))]),
+      caption = "Number of differential proteins for each cluster (average log2 fold-change > 1.5)") %>%
+  kable_styling(latex_options = c("striped", "hold_position")) %>% 
+  row_spec(row = 0, bold = T, color = "white", background = "gray")
+
+#perform enrichment
+enrich <- pblapply(unique(allMarkers$Cluster), function(x){
+  enrichR::enrichr(genes = allMarkers[allMarkers$Cluster==x, "gene"], databases = c("MSigDB_Hallmark_2020")) %>% 
+    do.call("rbind", .) %>% 
+    select(Term, Combined.Score) %>% 
+    mutate(Cluster = as.numeric(x))
+}, cl = 6) %>% 
+  do.call("rbind",.) %>% 
+  #convert to matrix
+  reshape2::dcast(., formula = Cluster ~ Term,
+                  value.var = "Combined.Score", fill = 0) %>% 
+  select(-Cluster) %>% 
+  t() %>% 
+  set_colnames(1:ncol(.)) %>% 
+  .[,names(clusterClassifications)]
+
+#markers heatmap
+pheatmap(prediction[allMarkers$gene, as.numeric(names(clusterClassifications))], scale = "row",
+         show_rownames = F, cluster_cols = F,
+         gaps_col = c(4, 6), main = "Marker proteins for each cluster (average log2 fold-change > 1.5)",
+         name = "Z-score")
+
+#pathways heatmap
+pheatmap(enrich[apply(enrich, 1, var) > 0,], scale = "row",
+         show_rownames = T, cluster_cols = F,
+         gaps_col = c(4, 6), main = "Hallmark geneset enrichment scores for cluster markers",
+         name = "Scaled enrichment score")
+
+#perform enrichment
+enrich2 <- pblapply(unique(allMarkers$Cluster), function(x){
+  enrichR::enrichr(genes = allMarkers[allMarkers$Cluster==x, "gene"], databases = c("OMIM_Disease")) %>% 
+    do.call("rbind", .) %>% 
+    select(Term, Combined.Score) %>% 
+    mutate(Cluster = as.numeric(x))
+}, cl = 6) %>% 
+  do.call("rbind",.) %>% 
+  #convert to matrix
+  reshape2::dcast(., formula = Cluster ~ Term,
+                  value.var = "Combined.Score", fill = 0) %>% 
+  select(-Cluster) %>% 
+  t() %>% 
+  set_colnames(1:ncol(.)) %>% 
+  .[,names(clusterClassifications)]
+
+
+#pathways heatmap
+pheatmap(enrich2[apply(enrich2, 1, var) > 0,], scale = "row",
+         show_rownames = T, cluster_cols = F, name = "Scaled enrichment score",
+         gaps_col = c(4, 6), main = "Genetic disease geneset enrichment scores for cluster markers")
+
+```
+
+
+
+
+
+
+
+
+
+
